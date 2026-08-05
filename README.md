@@ -4,8 +4,6 @@
 
 ![桌宠示意图](docs/preview.png)
 
-> 截图占位：可自行放置预览图到 `docs/preview.png`。
-
 ## ✨ 功能
 
 - **实时 Live2D 渲染**：QtWebEngine + pixi-live2d-display，无预渲染帧，角色一直在呼吸、摇摆
@@ -115,7 +113,7 @@ python -m venv .venv
 **聊天没反应 / 提示连接失败？**
 
 - 在「聊天设置」里确认 `api_key` 已填写、`base_url` 和 `model` 与你使用的服务商一致
-- 模型名按服务商实际提供填写（例如 DeepSeek 官方是 `deepseek-chat`）
+- 本项目默认模型是 `deepseek-v4-flash`，如果服务商不支持，可在「聊天设置」里改成它实际提供的模型名
 
 **为什么有时候表情/动作不明显？**
 
