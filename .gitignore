@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# 运行时文件（含 API Key，禁止提交）
+config.json
+settings.json
+pet*.log
+pet.pid
+pet_*.flag
+dbg_*
+*.tmp
+
+# 系统
+.DS_Store
+Thumbs.db
