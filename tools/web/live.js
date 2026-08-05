@@ -220,12 +220,17 @@ let manualExpression = null;
 function applyExpressionTarget(name) {
   name = name && name !== "none" ? name : null;
   if (name === activeExpression && exprFade > 0.01) return;
-  prevExpression = activeExpression;
+  // 切换前把所有表情参数归零，保证不会残留上一个表情（尤其是黑脸）。
+  for (const params of Object.values(EXPR_DATA)) {
+    for (const p of params) setParam(p.id, 0);
+  }
+  prevExpression = null;
   activeExpression = name;
   exprFade = 0;
 }
 
 function setPetState(name) {
+  const prevState = currentState;
   currentState = name;
   motionActive =
     name === "completed" || name === "interact"
@@ -236,7 +241,20 @@ function setPetState(name) {
       ? "working"
       : "idle";
   motionClock = 0;
-  const target = manualExpression || statusExpressionFor(name);
+  // 状态类表情（待机/思考/执行/完成/故障）永远优先：
+  // 一旦状态切换，手动表情自动让位并还原，避免表情（如黑脸）被一直锁住。
+  const statusState =
+    name === "idle" ||
+    name === "thinking" ||
+    name === "working" ||
+    name === "completed" ||
+    name === "fault";
+  if (statusState && name !== prevState) {
+    manualExpression = null;
+  }
+  // 故障状态强制显示黑脸，不受手动表情影响；结束后自动还原。
+  const target =
+    name === "fault" ? "black" : manualExpression || statusExpressionFor(name);
   applyExpressionTarget(target);
   transitionT = 0;
   if (name === "thinking") showBubble("思考中…", 2600);
@@ -353,6 +371,12 @@ function reportDiag() {
         expCount: Object.keys(EXPR_DATA).length,
         events: typeof canvas.addEventListener === "function",
         frameCount: frameCount,
+        expr: {
+          state: currentState,
+          active: activeExpression,
+          manual: manualExpression,
+          fade: +exprFade.toFixed(3),
+        },
       })
     );
   }

@@ -176,7 +176,8 @@ def get_codex_status():
                 resp = event.get("response") or {}
                 if (
                     "fail" in etype.lower()
-                    or resp.get("status") not in (None, "completed")
+                    or "error" in etype.lower()
+                    or resp.get("status") == "failed"
                     or resp.get("error")
                 ):
                     fault_ts = max(fault_ts or 0, ts)
