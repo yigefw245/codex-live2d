@@ -15,3 +15,6 @@ dbg_*
 # 系统
 .DS_Store
 Thumbs.db
+
+# 本地私有模型（版权原因不随仓库分发）
+model/youxiaomiao/
