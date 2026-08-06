@@ -487,6 +487,14 @@ function reportHead() {
 
 function reportDiag() {
   if (window.__bridge) {
+    let wm = null;
+    try {
+      if (model && model.internalModel && model.internalModel.coreModel) {
+        wm = +model.internalModel.coreModel
+          .getParameterValueById("Param85")
+          .toFixed(3);
+      }
+    } catch (e) {}
     window.__bridge.set_diag(
       JSON.stringify({
         ready: window.__ready,
@@ -504,6 +512,7 @@ function reportDiag() {
           fade: +exprFade.toFixed(3),
         },
         motion: { active: motionActive, preset: presetMotion, manual: manualMotion },
+        wm: wm,
       })
     );
   }
@@ -658,9 +667,13 @@ async function loadExpressions() {
       const file = typeof info === "string" ? info : info.file;
       const resp = await fetch(modelUrl(modelConfig, file));
       const obj = await resp.json();
+      const valueOverride =
+        typeof info === "object" && info.value !== undefined
+          ? info.value
+          : null;
       const params = (obj.Parameters || []).map((p) => ({
         id: p.Id,
-        value: p.Value,
+        value: valueOverride !== null ? valueOverride : p.Value,
       }));
       return [key, params];
     })
