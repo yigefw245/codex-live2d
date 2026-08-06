@@ -1,5 +1,7 @@
 # Codex Live2D 桌宠
 
+> **v2.0.0**：新增读屏幕、Soullink 情绪引擎（Embedding 情绪分类 + SDK 动作系统 + TTS 朗读，可作为开关切换，关闭即恢复原有关键词模式）。详见 [CHANGELOG.md](CHANGELOG.md)。
+
 一个基于 Live2D 模型的透明桌面宠物：实时渲染、眼神跟随鼠标，并且能感知 Codex 的运行状态自动切换动作和表情；还内置了角色聊天模式，可以像朋友一样和角色对话。内置 **yumi** 模型，支持随时切换或导入其他 Live2D 模型。
 
 ![桌宠示意图](docs/preview.png)
@@ -23,7 +25,18 @@
 - **聊天模式**：底部输入框和 yumi 对话
   - 回复以气泡漂浮在角色头顶
   - 根据回复情绪自动摆出动作和表情（开心→挥手爱心眼、难过→垂泪、生气→黑脸颤抖、思考→托腮、惊讶→后仰、中性→轻点头）
-- **右键菜单**：模型、动作、表情、放松、聊天模式、聊天设置、锁定拖动、放大缩小、恢复默认设置和模型、退出
+- **读屏幕**：右键 →「读屏幕」可开启定时观察屏幕
+  - 按设定频率（默认 10 分钟）截屏，调用视觉大模型识别画面内容
+  - 把识别结果交给聊天模型，让 yumi 以人设口吻回应一句
+  - 视觉模型接口（API 地址 / Key / 模型 / 提示词）在「读屏幕设置…」里配置
+- **Soullink 情绪引擎**（可选开关）：右键 →「Soullink 情绪引擎」开启后
+  - 情绪识别改用 [Soullink Emotion SDK](https://github.com/nanlingyin/soullink-emotion-sdk) 的 Embedding 分类（内置 1,400 条中文语料 + Top-K 投票，首次启用约 1 分钟初始化向量，之后自动缓存）
+  - 动作和表情改由 Soullink 引擎驱动（连续 VAD 情绪 + FACS 表情 + 待机动作 + 说话口型）
+  - 聊天回复自动用 TTS 朗读（默认百炼 Qwen-TTS / Cherry 音色）
+  - 任意模型都能用：开启时若该模型还没有参数映射（`soullink.profile.json`），会自动扫描模型生成；导入新模型后也会自动补生成，也可在菜单里手动「生成/更新当前模型 profile…」
+  - 开启期间自动禁用 Codex 状态动作匹配（思考中/执行中/完成/故障不抢动作），关闭后立即恢复
+  - 关闭后恢复原来的关键词情绪识别和动作系统
+- **右键菜单**：模型、动作、表情、放松、聊天模式、聊天设置、读屏幕、锁定拖动、放大缩小、恢复默认设置和模型、退出
 - **恢复默认**：一键把模型、大小、位置、锁定状态恢复为初始值（yumi）
 - **透明置顶无边框窗口**，不挡工作区，窗口大小自适应角色，拖不丢
 
@@ -32,6 +45,7 @@
 - Windows 10/11
 - Python 3.10+（建议 3.12）
 - 网络（首次安装依赖需要；聊天功能需要可用的 OpenAI 兼容接口）
+- Soullink 情绪引擎需要 Node.js 18+（`node --version` 可查，本项目在 Node 24 下验证）
 
 ## 🚀 快速开始
 
@@ -61,6 +75,34 @@ python -m venv .venv
 
 `config.json` 已被 `.gitignore` 忽略，不会提交到仓库（防止 Key 泄露）。也可以在桌宠右键菜单 →「聊天设置…」里直接填写，效果相同。
 
+读屏幕功能需要在 `config.json` 里额外配置视觉模型接口（同样可在右键菜单 →「读屏幕设置…」填写）：
+
+```json
+{
+  "screen_read": {
+    "enabled": false,
+    "interval_minutes": 10,
+    "vision": {
+      "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "api_key": "你的视觉模型 API Key",
+      "model": "qwen-vl-max",
+      "prompt": "请仔细看这张屏幕截图，用中文简要描述屏幕上正在显示的内容……"
+    }
+  }
+}
+```
+
+`enabled` 也可以通过右键菜单 →「读屏幕」→「开启读屏幕」随时开关。若本机已配置阿里云百炼的 `DASHSCOPE_API_KEY`，视觉 API Key 会自动复用，无需重复填写。
+
+Soullink 情绪引擎依赖 SDK 的 npm 包，首次使用前需要安装一次（不装也能用原有关键词模式）：
+
+```powershell
+cd tools/soullink
+npm install
+```
+
+安装完成后在桌宠右键菜单 →「Soullink 情绪引擎」→「开启」即可。Embedding 和 TTS 的 API Key 会自动复用本机百炼 Key（也可在「Soullink 设置…」里单独填写）。
+
 ### 3. 启动
 
 双击 `启动桌宠.bat`，或运行：
@@ -86,6 +128,12 @@ python -m venv .venv
 | 右键 → 表情 | 切换当前模型的全部自带表情 |
 | 右键 → 聊天模式 | 打开底部输入框，开始和 yumi 对话 |
 | 右键 → 聊天设置 | 配置聊天 API 地址 / Key / 模型 / 人设 |
+| 右键 → 读屏幕 → 开启读屏幕 | 开启/关闭定时观察屏幕（按设定频率自动读一次） |
+| 右键 → 读屏幕 → 读屏幕设置 | 配置读取频率、视觉 API 地址 / Key / 模型 / 提示词 |
+| 右键 → 读屏幕 → 立即读一次屏幕 | 立刻截屏识别并让 yumi 回应一次 |
+| 右键 → Soullink 情绪引擎 → 开启 | 开启 Embedding 情绪识别 + SDK 动作系统 + TTS 朗读 |
+| 右键 → Soullink 情绪引擎 → 设置 | 配置 Embedding API / TTS 接口与音色 / 动作风格 |
+| 右键 → Soullink 情绪引擎 → 生成/更新当前模型 profile | 重新扫描当前模型并生成/覆盖参数映射 |
 | 右键 → 放大 / 缩小 | 调整角色大小 |
 | 右键 → 恢复默认设置和模型 | 重置为 yumi、默认大小和位置 |
 | 右键 → 退出 | 关闭桌宠 |
@@ -94,7 +142,7 @@ python -m venv .venv
 
 ## ⚙️ 配置文件
 
-- `config.json`：聊天接口配置（`base_url`、`api_key`、`model`、`persona`），本地生成、不入库
+- `config.json`：聊天接口配置（`chat`）、读屏幕配置（`screen_read`）和 Soullink 配置（`soullink`），本地生成、不入库
 - `settings.json`：窗口位置、大小、锁定状态、当前模型，运行时会自动保存
 - 每个模型一个目录：`model/<id>/`，目录内的 `model.json` 声明模型文件名、动作预设、表情映射和状态绑定
 
@@ -103,15 +151,17 @@ python -m venv .venv
 ```
 ├── main.py                  # 桌宠主程序（PySide6 + QtWebEngine）
 ├── codex_monitor.py         # 读取 Codex 实时日志，识别思考/执行/完成/故障
+├── soullink_runner.py       # Soullink SDK 本地侧服务管理（启动/停止 Node 服务）
 ├── codex_pet_launcher.pyw   # 可选：随 Codex/桌面版启动的守护脚本
 ├── 启动桌宠.bat / 调试运行.bat
 ├── config.example.json      # 聊天配置模板（复制为 config.json 填写）
 ├── settings.example.json    # 窗口配置模板
 ├── model/
-│   └── yumi/                # yumi 模型 + model.json 配置（其余模型自行导入）
+│   └── yumi/                # yumi 模型 + model.json + soullink.profile.json（其余模型自行导入）
+├── tools/soullink/          # Soullink SDK 集成（Node 侧服务、profile 生成、浏览器桥接、npm 依赖）
 ├── tools/web/
 │   ├── live.html / live.js  # 实时渲染页面（动作、表情、眼神追踪、聊天 UI）
-│   └── lib/                 # PixiJS / Live2D 运行时库
+│   └── lib/                 # PixiJS / Live2D 运行时库 + soullink-emotion.esm.js
 └── docs/                    # 文档与截图
 ```
 

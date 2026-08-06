@@ -11,6 +11,11 @@ const chatInputEl = document.getElementById("chat-input");
 let bubbleTimer = null;
 let chatPanelH = 0;
 let chatReactTimer = null;
+let soullink = { enabled: false, config: null, bridge: null, starting: null };
+
+function soullinkEnabled() {
+  return soullink.enabled;
+}
 
 let app = null;
 let model = null;
@@ -39,8 +44,6 @@ let headKnown = false;
 let baseScale = 1;
 let currentScale = 1;
 let baseBounds = null;
-let frameCount = 0;
-let lastReportedFrame = -1;
 
 function clamp(v, lo, hi) {
   return Math.max(lo, Math.min(hi, v));
@@ -201,6 +204,7 @@ function applyExpressionTarget(face, pose) {
 
 // 应用某个状态的外观（动作 + 姿势 + 表情），不弹气泡。
 function applyStateVisuals(name) {
+  if (soullinkEnabled()) return;
   const act = resolveStatusAction(name);
   let face = manualExpression || act.face;
   let pose = act.pose;
@@ -366,7 +370,6 @@ function setPetState(name) {
   else if (name === "fault") showBubble("故障！", 2600);
   else if (name === "idle") showBubble("待机中", 1800);
   else if (name === "interact") showBubble("嗨！", 1600);
-  if (window.__bridge) window.__bridge.set_state_ack(name);
 }
 
 function setExpression(name) {
@@ -392,8 +395,8 @@ function stopMotion() {
 // ---------- chat ----------
 
 function chatReact(emotion) {
+  if (soullinkEnabled()) return;
   if (chatReactTimer) clearTimeout(chatReactTimer);
-  if (window.__bridge) window.__bridge.set_diag("chatReact:" + emotion);
   const prevState = currentState;
   const generic = {
     happy: { face: "heart" },
@@ -458,6 +461,88 @@ function sendChat() {
   window.__bridge.send_chat(text);
 }
 
+// ---------- Soullink Emotion SDK ----------
+
+async function ensureSoullinkBridge() {
+  if (soullink.bridge) return soullink.bridge;
+  if (soullink.starting) return soullink.starting;
+  soullink.starting = (async () => {
+    await import("/tools/web/lib/soullink-emotion.esm.js");
+    const bridge = window.__soullink;
+    if (!bridge) throw new Error("Soullink SDK 未初始化");
+    soullink.bridge = bridge;
+    return bridge;
+  })();
+  try {
+    return await soullink.starting;
+  } finally {
+    soullink.starting = null;
+  }
+}
+
+async function stopSoullink() {
+  soullink.enabled = false;
+  if (soullink.bridge) {
+    try {
+      soullink.bridge.stop();
+    } catch (err) {
+      console.error("[soullink] stop failed", err);
+    }
+  }
+}
+
+window.setSoullinkConfig = async (cfg) => {
+  soullink.config = cfg;
+  if (!cfg || !cfg.enabled) {
+    await stopSoullink();
+    return;
+  }
+  try {
+    const bridge = await ensureSoullinkBridge();
+    await bridge.start({
+      profileUrl: cfg.profileUrl,
+      ttsUrl: cfg.ttsUrl,
+      motionStyle: cfg.motionStyle || "natural"
+    });
+    soullink.enabled = true;
+    if (model) bridge.setModel(model);
+  } catch (err) {
+    console.error("[soullink] start failed", err);
+    soullink.enabled = false;
+    showBubble("Soullink 启动失败：" + (err && err.message ? err.message : err), 6000);
+  }
+};
+
+window.setSoullinkEnabled = (on) => {
+  if (!on && soullink.enabled) void stopSoullink();
+};
+
+window.soullinkRestart = async () => {
+  await stopSoullink();
+  if (soullink.config && soullink.config.enabled) {
+    await window.setSoullinkConfig(soullink.config);
+  }
+};
+
+window.soullinkChat = (payload) => {
+  if (!payload) return;
+  if (!soullinkEnabled() || !soullink.bridge) {
+    if (payload.reply) showChatReply(payload.reply, 6000);
+    return;
+  }
+  const intent = payload.intent || null;
+  if (payload.reply) showChatReply(payload.reply, 6000);
+  if (intent) {
+    soullink.bridge.react(intent);
+    soullink.bridge.speak({
+      text: payload.reply || "",
+      emotion: intent.naturalEmotion || intent.emotion,
+      vad: intent.naturalVAD,
+      intent
+    });
+  }
+};
+
 // ---------- layout ----------
 
 function computeHeadRef() {
@@ -489,30 +574,6 @@ function reportHead() {
   const ch = window.innerHeight;
   if (window.__bridge && cw > 0 && ch > 0) {
     window.__bridge.set_head(headX / cw, headY / ch);
-  }
-}
-
-function reportDiag() {
-  if (window.__bridge) {
-    window.__bridge.set_diag(
-      JSON.stringify({
-        ready: window.__ready,
-        error: window.__error || null,
-        bridge: !!window.__bridge,
-        model: !!model,
-        modelId: modelConfig ? modelConfig.id : null,
-        expCount: Object.keys(EXPR_DATA).length,
-        frameCount: frameCount,
-        expr: {
-          state: currentState,
-          face: activeFace,
-          pose: activePose,
-          manual: manualExpression,
-          fade: +exprFade.toFixed(3),
-        },
-        motion: { active: motionActive, preset: presetMotion, manual: manualMotion },
-      })
-    );
   }
 }
 
@@ -612,42 +673,41 @@ function setScale(s) {
 function onFrame(ts) {
   requestAnimationFrame(onFrame);
   if (!model) return;
-  frameCount++;
-  if (frameCount - lastReportedFrame >= 300) {
-    lastReportedFrame = frameCount;
-    reportDiag();
-  }
   const dt = lastTs ? Math.min(0.1, (ts - lastTs) / 1000) : 0.016;
   lastTs = ts;
   const t = ts / 1000;
 
-  // Eye / head follow the mouse (target comes from Python, screen-space).
-  const nx = clamp(eyeTargetX, -1, 1);
-  const ny = clamp(eyeTargetY, -1, 1);
-  eyeX += (nx - eyeX) * Math.min(1, dt * 6);
-  eyeY += (ny - eyeY) * Math.min(1, dt * 6);
-  setParam("ParamEyeBallX", eyeX);
-  setParam("ParamEyeBallY", -eyeY * 0.9);
-  setParam("ParamAngleX", eyeX * 22);
-  setParam("ParamAngleY", -eyeY * 18);
-  setParam("ParamBodyAngleX", eyeX * 5);
+  if (!soullinkEnabled()) {
+    // Eye / head follow the mouse (target comes from Python, screen-space).
+    const nx = clamp(eyeTargetX, -1, 1);
+    const ny = clamp(eyeTargetY, -1, 1);
+    eyeX += (nx - eyeX) * Math.min(1, dt * 6);
+    eyeY += (ny - eyeY) * Math.min(1, dt * 6);
+    setParam("ParamEyeBallX", eyeX);
+    setParam("ParamEyeBallY", -eyeY * 0.9);
+    setParam("ParamAngleX", eyeX * 22);
+    setParam("ParamAngleY", -eyeY * 18);
+    setParam("ParamBodyAngleX", eyeX * 5);
 
-  // Gentle breathing so the character stays alive.
-  setParam("ParamBreath", 0.5 + 0.5 * Math.sin((t * Math.PI * 2) / 4.5));
+    // Gentle breathing so the character stays alive.
+    setParam("ParamBreath", 0.5 + 0.5 * Math.sin((t * Math.PI * 2) / 4.5));
 
-  model.update(dt);
-  applyMotion(dt);
-  applyTransition(dt);
+    model.update(dt);
+    applyMotion(dt);
+    applyTransition(dt);
 
-  // Expressions: fade in/out the parameter values ourselves.
-  if (activeFace || activePose) {
-    exprFade = Math.min(1, exprFade + dt / 0.4);
-    const inp = exprFade;
-    for (const key of [activeFace, activePose]) {
-      const params = key && EXPR_DATA[key];
-      if (!params) continue;
-      for (const p of params) setParam(p.id, p.value * inp);
+    // Expressions: fade in/out the parameter values ourselves.
+    if (activeFace || activePose) {
+      exprFade = Math.min(1, exprFade + dt / 0.4);
+      const inp = exprFade;
+      for (const key of [activeFace, activePose]) {
+        const params = key && EXPR_DATA[key];
+        if (!params) continue;
+        for (const p of params) setParam(p.id, p.value * inp);
+      }
     }
+  } else {
+    model.update(dt);
   }
 
   app.render();
@@ -716,8 +776,10 @@ async function loadModel(cfg) {
   fitModel();
   baseScale = model.scale.x;
   setPetState(currentState);
+  if (soullinkEnabled() && soullink.bridge) {
+    soullink.bridge.setModel(model);
+  }
   setTimeout(() => measureBounds(), 150);
-  reportDiag();
 }
 
 function setupEvents() {
@@ -793,7 +855,6 @@ function connectBridge() {
     if (!pet) return;
     window.__bridge = pet;
     if (baseBounds) reportBounds();
-    reportDiag();
     window.__ready = true;
   });
   return true;
@@ -821,14 +882,12 @@ async function init() {
   if (!modelConfig) {
     window.__ready = true;
     window.__error = "no model config";
-    reportDiag();
     return;
   }
 
   await loadModel(modelConfig);
   requestAnimationFrame(onFrame);
   window.__ready = true;
-  setTimeout(reportDiag, 400);
 }
 
 init().catch((err) => {

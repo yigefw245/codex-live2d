@@ -19,3 +19,8 @@ Thumbs.db
 # 本地私有模型（版权原因不随仓库分发），仓库只保留默认 yumi
 model/*
 !model/yumi/
+
+# Soullink SDK 本地依赖与运行缓存（含 API Key 配置）
+tools/soullink/node_modules/
+tools/soullink/cache/
+tools/soullink/run/

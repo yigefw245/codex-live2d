@@ -28,6 +28,12 @@ def _tail(path, size=262144):
 def _iso_to_epoch(value):
     if not isinstance(value, str):
         return None
+    try:
+        return datetime.datetime.fromisoformat(
+            value.replace("Z", "+00:00")
+        ).timestamp()
+    except Exception:
+        return None
 
 
 def _read_recent_logs(after_ts, limit=2500):
@@ -45,12 +51,6 @@ def _read_recent_logs(after_ts, limit=2500):
         return rows
     except Exception:
         return []
-    try:
-        return datetime.datetime.fromisoformat(
-            value.replace("Z", "+00:00")
-        ).timestamp()
-    except Exception:
-        return None
 
 
 def _message_text(content):

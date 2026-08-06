@@ -1,0 +1,21 @@
+{
+  "name": "live2d-soullink",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Soullink Emotion SDK integration for the Live2D desktop pet",
+  "dependencies": {
+    "@soullink-emotion/classifier-embedding": "0.1.0-beta.1",
+    "@soullink-emotion/engine": "0.1.0-beta.1",
+    "@soullink-emotion/planner-openai": "^0.1.0-beta.1",
+    "@soullink-emotion/profile-generator": "^0.1.0-beta.1",
+    "@soullink-emotion/runtime-core": "0.1.0-beta.1"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  },
+  "scripts": {
+    "build:browser": "esbuild browser/bridge.js --bundle --format=esm --target=es2020 --outfile=../web/lib/soullink-emotion.esm.js",
+    "server": "node server.mjs"
+  }
+}

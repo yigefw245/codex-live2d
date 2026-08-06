@@ -1,4 +1,5 @@
 import atexit
+import base64
 import ctypes
 import json
 import os
@@ -12,18 +13,21 @@ import urllib.request
 import zipfile
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
-from PySide6.QtCore import QObject, QTimer, QUrl, Qt, Signal, Slot
+from PySide6.QtCore import QBuffer, QIODevice, QObject, QTimer, QUrl, Qt, Signal, Slot
 from PySide6.QtGui import QAction, QColor, QCursor, QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
+    QLabel,
     QLineEdit,
     QMenu,
     QMessageBox,
     QPlainTextEdit,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -32,6 +36,7 @@ from PySide6.QtWebEngineCore import QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
 import codex_monitor
+import soullink_runner
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ERROR_LOG = os.path.join(BASE_DIR, "pet_error.log")
@@ -148,7 +153,7 @@ def _expr_classify(name):
         ("notes", ("笔记", "写字", "书写", "notes")),
         ("phone", ("手机", "看手机", "phone")),
         ("lean", ("前倾", "俯身", "lean")),
-        ("fly", ("飞头", "飞头", "fly")),
+        ("fly", ("飞头", "fly")),
         ("wry", ("歪嘴", "wry")),
         ("tongue", ("舌头", "吐舌", "tongue")),
         ("raiseL", ("抬手左", "举左手", "raiseL", "left")),
@@ -275,21 +280,8 @@ def build_model_config(model_dir, model3_rel, display_name, model_id):
     return config, patched
 
 
-def load_pet_size():
-    """Base pixel size of the character, from the rendered manifest."""
-    try:
-        with open(
-            os.path.join(BASE_DIR, "pets", "yumi", "manifest.json"),
-            encoding="utf-8",
-        ) as f:
-            manifest = json.load(f)
-        bx, by, bx2, by2 = manifest["states"]["idle"]["bbox"]
-        return bx2 - bx + 1, by2 - by + 1
-    except Exception:
-        return 462, 858
-
-
-BASE_W, BASE_H = load_pet_size()
+# 初始窗口基准尺寸（页面加载后由前端上报真实模型包围盒，这里只用于首帧）。
+BASE_W, BASE_H = 462, 858
 
 
 def load_settings():
@@ -347,6 +339,43 @@ CHAT_DEFAULTS = {
 }
 
 
+VISION_DEFAULTS = {
+    "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "api_key": "",
+    "model": "qwen-vl-max",
+    "prompt": (
+        "请仔细看这张屏幕截图，用中文简要描述屏幕上正在显示的内容："
+        "主要窗口、标题或文字、应用类型、画面重点。客观描述即可，不要推测。"
+    ),
+}
+
+SCREEN_READ_DEFAULTS = {
+    "enabled": False,
+    "interval_minutes": 10,
+    "vision": dict(VISION_DEFAULTS),
+}
+
+
+SOULLINK_DEFAULTS = {
+    "enabled": False,
+    "motion_style": "natural",
+    "embedding": {
+        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "api_key": "",
+        "model": "text-embedding-v3",
+    },
+    "tts": {
+        "base_url": "https://dashscope.aliyuncs.com/api/v1",
+        "api_key": "",
+        "model": "qwen-tts",
+        "voice": "Cherry",
+        "language_type": "Chinese",
+    },
+}
+
+SOULLINK_MOTION_STYLES = ["natural", "lively", "calm", "shy"]
+
+
 def _read_env_file(path):
     data = {}
     try:
@@ -380,6 +409,118 @@ def load_chat_config():
         )
         cfg["api_key"] = _read_env_file(env_path).get("DASHSCOPE_API_KEY", "")
     return cfg
+
+
+def load_screen_read_config():
+    """读取读屏幕配置：开关、频率和视觉模型接口。"""
+    cfg = {
+        "enabled": SCREEN_READ_DEFAULTS["enabled"],
+        "interval_minutes": SCREEN_READ_DEFAULTS["interval_minutes"],
+        "vision": dict(VISION_DEFAULTS),
+    }
+    try:
+        with open(os.path.join(BASE_DIR, "config.json"), encoding="utf-8") as f:
+            saved = (json.load(f).get("screen_read") or {})
+        if isinstance(saved.get("enabled"), bool):
+            cfg["enabled"] = saved["enabled"]
+        try:
+            cfg["interval_minutes"] = max(1, int(saved.get("interval_minutes", 10)))
+        except (TypeError, ValueError):
+            pass
+        vision = saved.get("vision") or {}
+        for key in ("base_url", "api_key", "model", "prompt"):
+            if isinstance(vision.get(key), str) and vision[key].strip():
+                cfg["vision"][key] = vision[key].strip()
+    except Exception:
+        pass
+    # 本机已有 DashScope（阿里云百炼）视觉配置时直接复用
+    env_path = os.path.join(
+        os.path.expanduser("~"),
+        ".codex",
+        "skills",
+        "claude-vision-skill",
+        ".env",
+    )
+    env_data = _read_env_file(env_path)
+    if not cfg["vision"].get("api_key"):
+        key = (
+            os.environ.get("DASHSCOPE_API_KEY", "")
+            or env_data.get("DASHSCOPE_API_KEY", "")
+        )
+        if key:
+            cfg["vision"]["api_key"] = key
+    if not cfg["vision"].get("model"):
+        model = os.environ.get("VISION_MODEL", "") or env_data.get("VISION_MODEL", "")
+        if model:
+            cfg["vision"]["model"] = model
+    return cfg
+
+
+def save_screen_read_config(cfg):
+    config_path = os.path.join(BASE_DIR, "config.json")
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            root = json.load(f)
+    except Exception:
+        root = {}
+    root["screen_read"] = cfg
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(root, f, ensure_ascii=False, indent=2)
+
+
+def _dashscope_env():
+    env_path = os.path.join(
+        os.path.expanduser("~"),
+        ".codex",
+        "skills",
+        "claude-vision-skill",
+        ".env",
+    )
+    return _read_env_file(env_path)
+
+
+def load_soullink_config():
+    """读取 Soullink 情绪引擎配置（Embedding 分类 + TTS）。"""
+    cfg = {
+        "enabled": SOULLINK_DEFAULTS["enabled"],
+        "motion_style": SOULLINK_DEFAULTS["motion_style"],
+        "embedding": dict(SOULLINK_DEFAULTS["embedding"]),
+        "tts": dict(SOULLINK_DEFAULTS["tts"]),
+    }
+    try:
+        with open(os.path.join(BASE_DIR, "config.json"), encoding="utf-8") as f:
+            saved = (json.load(f).get("soullink") or {})
+        if isinstance(saved.get("enabled"), bool):
+            cfg["enabled"] = saved["enabled"]
+        if saved.get("motion_style") in SOULLINK_MOTION_STYLES:
+            cfg["motion_style"] = saved["motion_style"]
+        for section in ("embedding", "tts"):
+            saved_section = saved.get(section) or {}
+            for key in ("base_url", "api_key", "model", "voice", "language_type"):
+                if isinstance(saved_section.get(key), str) and saved_section[key].strip():
+                    cfg[section][key] = saved_section[key].strip()
+    except Exception:
+        pass
+    env_data = _dashscope_env()
+    dashscope_key = os.environ.get("DASHSCOPE_API_KEY", "") or env_data.get(
+        "DASHSCOPE_API_KEY", ""
+    )
+    for section in ("embedding", "tts"):
+        if not cfg[section].get("api_key") and dashscope_key:
+            cfg[section]["api_key"] = dashscope_key
+    return cfg
+
+
+def save_soullink_config(cfg):
+    config_path = os.path.join(BASE_DIR, "config.json")
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            root = json.load(f)
+    except Exception:
+        root = {}
+    root["soullink"] = cfg
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(root, f, ensure_ascii=False, indent=2)
 
 
 EMOTION_KEYWORDS = {
@@ -451,6 +592,53 @@ class ChatClient:
         return str(data["choices"][0]["message"]["content"]).strip()
 
 
+class VisionClient:
+    """OpenAI 兼容的视觉模型客户端，用于读屏幕识图。"""
+
+    def __init__(self, cfg):
+        cfg = cfg or {}
+        self.base = str(
+            cfg.get("base_url", VISION_DEFAULTS["base_url"])
+        ).rstrip("/")
+        self.key = str(cfg.get("api_key", ""))
+        self.model = str(cfg.get("model", VISION_DEFAULTS["model"]))
+        self.prompt = str(cfg.get("prompt", VISION_DEFAULTS["prompt"]))
+
+    def ready(self):
+        return bool(self.key and self.base and self.model)
+
+    def describe(self, image_b64, mime="image/jpeg", timeout=90):
+        body = {
+            "model": self.model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{mime};base64,{image_b64}"
+                            },
+                        },
+                        {"type": "text", "text": self.prompt},
+                    ],
+                }
+            ],
+            "max_tokens": 1024,
+        }
+        request = urllib.request.Request(
+            self.base + "/chat/completions",
+            data=json.dumps(body).encode("utf-8"),
+            headers={
+                "Authorization": "Bearer " + self.key,
+                "Content-Type": "application/json",
+            },
+        )
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        return str(data["choices"][0]["message"]["content"]).strip()
+
+
 class ChatSettingsDialog(QDialog):
     def __init__(self, cfg, parent=None):
         super().__init__(parent)
@@ -485,6 +673,143 @@ class ChatSettingsDialog(QDialog):
             "api_key": self.api_key_edit.text().strip(),
             "model": self.model_edit.text().strip(),
             "persona": self.persona_edit.toPlainText().strip(),
+        }
+
+
+class ScreenReadSettingsDialog(QDialog):
+    """读屏幕设置：读取频率 + 视觉模型接口。"""
+
+    def __init__(self, cfg, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("读屏幕设置")
+        self.setModal(True)
+        self.setMinimumWidth(440)
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.interval_spin = QSpinBox()
+        self.interval_spin.setRange(1, 180)
+        self.interval_spin.setValue(int(cfg.get("interval_minutes", 10)))
+        self.interval_spin.setSuffix(" 分钟")
+
+        vision = cfg.get("vision") or {}
+        self.base_url_edit = QLineEdit(str(vision.get("base_url", "")))
+        self.api_key_edit = QLineEdit(str(vision.get("api_key", "")))
+        self.api_key_edit.setEchoMode(QLineEdit.Password)
+        self.model_edit = QLineEdit(str(vision.get("model", "")))
+        self.prompt_edit = QPlainTextEdit(str(vision.get("prompt", "")))
+        self.prompt_edit.setFixedHeight(90)
+
+        form.addRow("读取频率", self.interval_spin)
+        form.addRow("视觉 API 地址", self.base_url_edit)
+        form.addRow("视觉 API Key", self.api_key_edit)
+        form.addRow("视觉模型", self.model_edit)
+        form.addRow("识别提示词", self.prompt_edit)
+        layout.addLayout(form)
+
+        hint = QLabel(
+            "开启后桌宠会按频率截取屏幕并发送给视觉模型识别，"
+            "再把识别结果交给聊天模型生成符合人设的回应。\n"
+            "截图会发送到你配置的视觉 API，请确认接口可信。"
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #888;")
+        layout.addWidget(hint)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def values(self):
+        return {
+            "interval_minutes": self.interval_spin.value(),
+            "vision": {
+                "base_url": self.base_url_edit.text().strip().rstrip("/"),
+                "api_key": self.api_key_edit.text().strip(),
+                "model": self.model_edit.text().strip(),
+                "prompt": self.prompt_edit.toPlainText().strip(),
+            },
+        }
+
+
+class SoullinkSettingsDialog(QDialog):
+    """Soullink 情绪引擎设置：Embedding 分类接口 + TTS + 动作风格。"""
+
+    def __init__(self, cfg, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Soullink 情绪引擎设置")
+        self.setModal(True)
+        self.setMinimumWidth(460)
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        embedding = cfg.get("embedding") or {}
+        self.embed_base_edit = QLineEdit(str(embedding.get("base_url", "")))
+        self.embed_key_edit = QLineEdit(str(embedding.get("api_key", "")))
+        self.embed_key_edit.setEchoMode(QLineEdit.Password)
+        self.embed_model_edit = QLineEdit(str(embedding.get("model", "")))
+
+        tts = cfg.get("tts") or {}
+        self.tts_base_edit = QLineEdit(str(tts.get("base_url", "")))
+        self.tts_key_edit = QLineEdit(str(tts.get("api_key", "")))
+        self.tts_key_edit.setEchoMode(QLineEdit.Password)
+        self.tts_model_edit = QLineEdit(str(tts.get("model", "")))
+        self.voice_combo = QComboBox()
+        self.voice_combo.setEditable(True)
+        voices = ["Cherry", "Serena", "Ethan", "Chelsie"]
+        current_voice = str(tts.get("voice", "Cherry"))
+        if current_voice not in voices:
+            voices.insert(0, current_voice)
+        self.voice_combo.addItems(voices)
+        self.voice_combo.setCurrentText(current_voice)
+
+        self.style_combo = QComboBox()
+        self.style_combo.addItems(SOULLINK_MOTION_STYLES)
+        self.style_combo.setCurrentText(str(cfg.get("motion_style", "natural")))
+
+        form.addRow("Embedding API 地址", self.embed_base_edit)
+        form.addRow("Embedding API Key", self.embed_key_edit)
+        form.addRow("Embedding 模型", self.embed_model_edit)
+        form.addRow("TTS API 地址", self.tts_base_edit)
+        form.addRow("TTS API Key", self.tts_key_edit)
+        form.addRow("TTS 模型", self.tts_model_edit)
+        form.addRow("TTS 音色", self.voice_combo)
+        form.addRow("动作风格", self.style_combo)
+        layout.addLayout(form)
+
+        hint = QLabel(
+            "开启后，聊天气氛将改用 SDK 的 Embedding 情绪分类（首次启用需约 1 分钟"
+            "初始化中文语料向量，之后自动缓存），动作系统由 Soullink 引擎驱动，"
+            "回复会通过 TTS 朗读出来。若本机已配置 DASHSCOPE_API_KEY，"
+            "Embedding 和 TTS 的 Key 会自动复用。"
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #888;")
+        layout.addWidget(hint)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def values(self):
+        return {
+            "motion_style": self.style_combo.currentText(),
+            "embedding": {
+                "base_url": self.embed_base_edit.text().strip().rstrip("/"),
+                "api_key": self.embed_key_edit.text().strip(),
+                "model": self.embed_model_edit.text().strip(),
+            },
+            "tts": {
+                "base_url": self.tts_base_edit.text().strip().rstrip("/"),
+                "api_key": self.tts_key_edit.text().strip(),
+                "model": self.tts_model_edit.text().strip(),
+                "voice": self.voice_combo.currentText().strip(),
+                "language_type": "Chinese",
+            },
         }
 
 
@@ -523,33 +848,11 @@ class PetBridge(QObject):
     def back_to_codex(self):
         self.window.set_chat_mode(False)
 
-    @Slot(str)
-    def set_diag(self, text):
-        try:
-            with open(
-                os.path.join(BASE_DIR, "pet_diag.log"),
-                "a",
-                encoding="utf-8",
-            ) as f:
-                f.write(f"{time.ctime()} {text}\n")
-        except OSError:
-            pass
-
-    @Slot(str)
-    def set_state_ack(self, name):
-        try:
-            with open(
-                os.path.join(BASE_DIR, "pet_state_ack.log"),
-                "a",
-                encoding="utf-8",
-            ) as f:
-                f.write(f"{time.ctime()} {name}\n")
-        except OSError:
-            pass
-
-
 class PetWindow(QWidget):
     chat_reply = Signal(str)
+    soullink_event = Signal(str)
+    soullink_js = Signal(str)
+    soullink_status = Signal(str)
 
     def __init__(self):
         super().__init__()
@@ -583,6 +886,21 @@ class PetWindow(QWidget):
         self.chat_history = []
         self.chat_mode = False
         self.chat_reply.connect(self._show_chat_reply)
+        self.screen_cfg = load_screen_read_config()
+        self.vision_client = VisionClient(self.screen_cfg.get("vision") or {})
+        self.screen_timer = QTimer(self)
+        self.screen_timer.timeout.connect(self.read_screen_now)
+        self.screen_read_busy = False
+        if self.screen_cfg.get("enabled"):
+            self._start_screen_timer()
+        self.soullink_cfg = load_soullink_config()
+        self.soullink_runner = soullink_runner.SoullinkRunner()
+        self.soullink_ready = False
+        self.soullink_event.connect(self._send_soullink_event)
+        self.soullink_js.connect(self._run_js)
+        self.soullink_status.connect(self._notify)
+        if self.soullink_cfg.get("enabled"):
+            QTimer.singleShot(0, self._start_soullink_async)
         self.dragging = False
         self.drag_start_pos = None
         self.drag_start_window = None
@@ -713,6 +1031,7 @@ class PetWindow(QWidget):
         )
         self._run_js(f"window.setPetState({json.dumps(self.state)})")
         self._run_js(f"window.setScale({self.scale})")
+        self._push_soullink_config()
 
     def set_state(self, name):
         self.state = name
@@ -907,6 +1226,7 @@ class PetWindow(QWidget):
             return
         self.models = list_models()
         self.switch_model(model_id)
+        self._ensure_soullink_profile_async(model_id)
         self._notify(f"模型导入完成：{display_name}")
 
     def _notify(self, text):
@@ -928,6 +1248,14 @@ class PetWindow(QWidget):
         self.current_expression = None
         self.chat_mode = False
         self._run_js("window.setChatMode(false)")
+        self.screen_cfg["enabled"] = False
+        save_screen_read_config(self.screen_cfg)
+        self.screen_timer.stop()
+        self.soullink_cfg["enabled"] = False
+        save_soullink_config(self.soullink_cfg)
+        self.soullink_runner.stop()
+        self.soullink_ready = False
+        self._run_js("window.setSoullinkEnabled(false)")
         self.apply_geometry()
         self.move_to_saved_position()
         self.view.resize(self.width(), self.height())
@@ -958,6 +1286,19 @@ class PetWindow(QWidget):
             reply = f"（连接失败：{exc}）"
         self.chat_history.append({"role": "user", "content": text})
         self.chat_history.append({"role": "assistant", "content": reply})
+        if self._soullink_usable():
+            try:
+                intent = self.soullink_runner.classify(text)
+            except Exception:
+                intent = None
+            if intent:
+                self.soullink_event.emit(
+                    json.dumps(
+                        {"reply": reply, "intent": intent},
+                        ensure_ascii=False,
+                    )
+                )
+                return
         self.chat_reply.emit(reply)
 
     def _show_chat_reply(self, reply):
@@ -996,6 +1337,281 @@ class PetWindow(QWidget):
         with open(config_path, "w", encoding="utf-8") as f:
             json.dump(root, f, ensure_ascii=False, indent=2)
         self.chat_client = ChatClient(load_chat_config())
+
+    # ---------- 读屏幕 ----------
+
+    def _start_screen_timer(self):
+        minutes = max(1, int(self.screen_cfg.get("interval_minutes", 10)))
+        self.screen_timer.start(minutes * 60 * 1000)
+
+    def set_screen_read_enabled(self, enabled):
+        enabled = bool(enabled)
+        self.screen_cfg["enabled"] = enabled
+        save_screen_read_config(self.screen_cfg)
+        if enabled:
+            self._start_screen_timer()
+            self._notify(
+                f"读屏幕已开启，每 {self.screen_cfg.get('interval_minutes', 10)} 分钟看一次"
+            )
+            QTimer.singleShot(2000, self.read_screen_now)
+        else:
+            self.screen_timer.stop()
+            self._notify("读屏幕已关闭")
+
+    def read_screen_now(self):
+        if self.screen_read_busy:
+            return
+        self.screen_read_busy = True
+        try:
+            shot = self._capture_screen_base64()
+        except Exception as exc:
+            self.screen_read_busy = False
+            self._notify(f"读屏幕失败：{exc}")
+            return
+        if shot is None:
+            self.screen_read_busy = False
+            self._notify("读屏幕失败：无法截取屏幕")
+            return
+        threading.Thread(
+            target=self._screen_read_worker,
+            args=(shot[0], shot[1]),
+            daemon=True,
+        ).start()
+
+    def _capture_screen_base64(self):
+        """截取主屏幕并压缩为 base64 JPEG（截屏前先隐藏自己）。"""
+        screen = QGuiApplication.primaryScreen()
+        if screen is None:
+            return None
+        self.hide()
+        QApplication.processEvents()
+        try:
+            pixmap = screen.grabWindow(0)
+        finally:
+            self.show()
+            QApplication.processEvents()
+        if pixmap.isNull():
+            return None
+        img = pixmap.toImage()
+        max_side = 1280
+        if max(img.width(), img.height()) > max_side:
+            img = img.scaled(
+                max_side,
+                max_side,
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation,
+            )
+        buf = QBuffer()
+        buf.open(QIODevice.WriteOnly)
+        img.save(buf, "JPG", 85)
+        image_b64 = base64.b64encode(bytes(buf.data())).decode("ascii")
+        return image_b64, "image/jpeg"
+
+    def _screen_read_worker(self, image_b64, mime):
+        reply = None
+        desc = None
+        try:
+            if not self.vision_client or not self.vision_client.ready():
+                reply = (
+                    "（读屏幕：还没有配置视觉模型接口，"
+                    "请在菜单的 读屏幕设置 里填写 API 信息）"
+                )
+            else:
+                desc = self.vision_client.describe(image_b64, mime)
+                prompt = (
+                    "（读屏幕）我刚才悄悄看了一眼使用者的屏幕，看到的内容是："
+                    f"{desc}\n"
+                    "请以你的人物设定，用简短自然的一两句话回应这个画面，"
+                    "像微信聊天一样，不要使用 Markdown，不要提及识图或你是 AI。"
+                )
+                if not self.chat_client or not self.chat_client.ready():
+                    reply = f"我看到屏幕上好像有：{desc}"
+                else:
+                    reply = self.chat_client.chat([], prompt)
+        except Exception as exc:
+            reply = f"（读屏幕失败：{exc}）"
+        finally:
+            self.screen_read_busy = False
+        if reply:
+            if self._soullink_usable() and desc:
+                try:
+                    intent = self.soullink_runner.classify(desc)
+                except Exception:
+                    intent = None
+                if intent:
+                    self.soullink_event.emit(
+                        json.dumps(
+                            {"reply": reply, "intent": intent},
+                            ensure_ascii=False,
+                        )
+                    )
+                    return
+            self.chat_reply.emit(reply)
+
+    def open_screen_read_settings(self):
+        cfg = load_screen_read_config()
+        dialog = ScreenReadSettingsDialog(cfg, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        data = dialog.values()
+        self.screen_cfg["interval_minutes"] = data["interval_minutes"]
+        self.screen_cfg["vision"] = data["vision"]
+        save_screen_read_config(self.screen_cfg)
+        self.vision_client = VisionClient(self.screen_cfg.get("vision") or {})
+        if self.screen_cfg.get("enabled"):
+            self._start_screen_timer()
+
+    # ---------- Soullink 情绪引擎 ----------
+
+    def _soullink_usable(self):
+        return bool(
+            self.soullink_cfg.get("enabled")
+            and self.soullink_runner
+            and self.soullink_runner.ready
+        )
+
+    def _soullink_profile_url(self):
+        return f"/model/{self.model_id}/soullink.profile.json"
+
+    def _soullink_has_profile(self):
+        return os.path.isfile(
+            os.path.join(MODEL_DIR, self.model_id, "soullink.profile.json")
+        )
+
+    def _push_soullink_config(self):
+        if not self.soullink_cfg.get("enabled") or not self.soullink_runner:
+            self.soullink_js.emit("window.setSoullinkEnabled(false)")
+            return
+        if not self.soullink_runner.ready or not self.soullink_runner.port:
+            self.soullink_js.emit("window.setSoullinkEnabled(false)")
+            return
+        if not self._soullink_has_profile():
+            self.soullink_js.emit("window.setSoullinkEnabled(false)")
+            return
+        payload = {
+            "enabled": True,
+            "ttsUrl": f"http://127.0.0.1:{self.soullink_runner.port}/tts",
+            "profileUrl": self._soullink_profile_url(),
+            "motionStyle": self.soullink_cfg.get("motion_style", "natural"),
+        }
+        self.soullink_js.emit(
+            f"window.setSoullinkConfig({json.dumps(payload, ensure_ascii=False)})"
+        )
+
+    def _start_soullink_async(self):
+        def _start():
+            try:
+                self.soullink_runner.start(self.soullink_cfg)
+                self.soullink_ready = True
+            except Exception as exc:
+                self.soullink_ready = False
+                self.soullink_cfg["enabled"] = False
+                save_soullink_config(self.soullink_cfg)
+                self.chat_reply.emit(f"（Soullink 启动失败：{exc}）")
+                return
+            # 当前模型没有 profile 时自动生成（yumi 已带，其他模型自动扫描生成）
+            if not self._soullink_has_profile():
+                ok, msg = self.soullink_runner.generate_profile(self.model_id)
+                if not ok:
+                    self.soullink_ready = False
+                    self.soullink_cfg["enabled"] = False
+                    save_soullink_config(self.soullink_cfg)
+                    self.soullink_runner.stop()
+                    self.chat_reply.emit(
+                        f"（Soullink 模型配置生成失败：{msg}）"
+                    )
+                    return
+                self.soullink_status.emit(
+                    f"已为「{self.model_id}」自动生成 Soullink 配置"
+                )
+            self.soullink_js.emit("window.setSoullinkEnabled(true)")
+            self._push_soullink_config()
+            self.soullink_status.emit(
+                "Soullink 情绪引擎已启动，正在初始化情绪语料（首次约 1 分钟）"
+            )
+            self.soullink_runner.wait_classifier_ready(
+                on_ready=lambda: self.soullink_status.emit(
+                    "Soullink 情绪识别已就绪"
+                )
+            )
+
+        threading.Thread(target=_start, daemon=True).start()
+
+    def set_soullink_enabled(self, enabled):
+        enabled = bool(enabled)
+        self.soullink_cfg["enabled"] = enabled
+        save_soullink_config(self.soullink_cfg)
+        if enabled:
+            if not self.soullink_runner.node_path():
+                self.soullink_cfg["enabled"] = False
+                save_soullink_config(self.soullink_cfg)
+                self._notify("Soullink 需要 Node.js（18+），请先安装 Node")
+                return
+            self._start_soullink_async()
+        else:
+            self.soullink_ready = False
+            self.soullink_runner.stop()
+            self._run_js("window.setSoullinkEnabled(false)")
+            # 关闭 Soullink 后立即恢复 Codex 状态动作匹配
+            self.refresh_status()
+            self._notify("Soullink 情绪引擎已关闭，恢复原有关键词识别")
+
+    def open_soullink_settings(self):
+        cfg = load_soullink_config()
+        dialog = SoullinkSettingsDialog(cfg, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        data = dialog.values()
+        data["enabled"] = bool(self.soullink_cfg.get("enabled"))
+        self.soullink_cfg.update(data)
+        save_soullink_config(self.soullink_cfg)
+        if self.soullink_ready and self.soullink_runner and self.soullink_runner.ready:
+            # 配置变更后重启侧服务使新模型/Key 生效
+            self.soullink_runner.stop()
+            self.soullink_ready = False
+            if self.soullink_cfg.get("enabled"):
+                self._start_soullink_async()
+            else:
+                self._run_js("window.setSoullinkEnabled(false)")
+
+    def regenerate_soullink_profile(self):
+        """手动重新生成当前模型的 Soullink profile（强制覆盖）。"""
+
+        def _work():
+            ok, msg = self.soullink_runner.generate_profile(
+                self.model_id, force=True
+            )
+            if not ok:
+                self.soullink_status.emit(
+                    f"「{self.model_id}」配置生成失败：{msg}"
+                )
+                return
+            self.soullink_status.emit(
+                f"「{self.model_id}」的 Soullink 配置已重新生成"
+            )
+            if self.soullink_cfg.get("enabled"):
+                # 让前端用新 profile 重启 SDK 会话
+                self.soullink_js.emit("window.soullinkRestart()")
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _ensure_soullink_profile_async(self, model_id):
+        """模型导入后后台补生成 profile（已存在则跳过）。"""
+
+        def _work():
+            ok, msg = self.soullink_runner.generate_profile(model_id)
+            if not ok:
+                self.soullink_status.emit(
+                    f"「{model_id}」Soullink 配置生成失败：{msg}"
+                )
+                return
+            if self.soullink_cfg.get("enabled") and model_id == self.model_id:
+                self._push_soullink_config()
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _send_soullink_event(self, payload_json):
+        self._run_js(f"window.soullinkChat({payload_json})")
 
     def set_pet_state(self, name):
         self.pet_state = name
@@ -1221,6 +1837,48 @@ class PetWindow(QWidget):
             menu.addAction(
                 QAction("聊天设置…", self, triggered=self.open_chat_settings)
             )
+            screen_menu = menu.addMenu("读屏幕")
+            screen_toggle = QAction("开启读屏幕", self, checkable=True)
+            screen_toggle.setChecked(bool(self.screen_cfg.get("enabled")))
+            screen_toggle.triggered.connect(self.set_screen_read_enabled)
+            screen_menu.addAction(screen_toggle)
+            screen_menu.addAction(
+                QAction(
+                    "读屏幕设置…",
+                    self,
+                    triggered=self.open_screen_read_settings,
+                )
+            )
+            screen_menu.addAction(
+                QAction(
+                    "立即读一次屏幕",
+                    self,
+                    triggered=self.read_screen_now,
+                )
+            )
+            soullink_menu = menu.addMenu("Soullink 情绪引擎")
+            soullink_toggle = QAction(
+                "开启（Embedding 识别 + 动作 + TTS）",
+                self,
+                checkable=True,
+            )
+            soullink_toggle.setChecked(bool(self.soullink_cfg.get("enabled")))
+            soullink_toggle.triggered.connect(self.set_soullink_enabled)
+            soullink_menu.addAction(soullink_toggle)
+            soullink_menu.addAction(
+                QAction(
+                    "Soullink 设置…",
+                    self,
+                    triggered=self.open_soullink_settings,
+                )
+            )
+            soullink_menu.addAction(
+                QAction(
+                    "生成/更新当前模型 profile…",
+                    self,
+                    triggered=self.regenerate_soullink_profile,
+                )
+            )
             menu.addSeparator()
             lock_action = QAction(
                 "解锁拖动" if self.locked else "锁定拖动", self
@@ -1275,6 +1933,10 @@ class PetWindow(QWidget):
                 f.write("1")
         except OSError:
             pass
+        try:
+            self.soullink_runner.stop()
+        except Exception:
+            pass
         app = QApplication.instance()
         if app is not None:
             app.quit()
@@ -1293,6 +1955,9 @@ class PetWindow(QWidget):
             app = QApplication.instance()
             if app is not None:
                 app.quit()
+            return
+        if self.soullink_cfg.get("enabled"):
+            # Soullink 模式：禁用 Codex 状态动作匹配
             return
         status = codex_monitor.get_codex_status()
         new_state = status.get("state") or "idle"
