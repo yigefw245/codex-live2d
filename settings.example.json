@@ -2,5 +2,6 @@
   "scale": 1.0,
   "pos_x": null,
   "pos_y": null,
-  "locked": true
+  "locked": true,
+  "model": "yumi"
 }

@@ -1,28 +1,8 @@
 "use strict";
 
-const MODEL_URL = "/model/yumi/yumi.model3.json";
+const MODEL_ROOT = "/model/";
 const STATUS_H = 0;
 const PAD = 12;
-
-const EXPR_FILES = {
-  heart: "爱心眼.exp3.json",
-  star: "星星眼.exp3.json",
-  tear: "眼泪.exp3.json",
-  teary: "泪汪汪.exp3.json",
-  wry: "歪嘴.exp3.json",
-  catmouth: "猫猫嘴.exp3.json",
-  eyepatch: "眼罩.exp3.json",
-  black: "黑脸.exp3.json",
-  swirl: "蚊香眼.exp3.json",
-  tongue: "舌头伸出.exp3.json",
-  mic: "拿话筒.exp3.json",
-  bend: "俯身按键.exp3.json",
-  raiseL: "抬手左.exp3.json",
-  raiseR: "抬手右.exp3.json",
-  dog: "漂浮小狗.exp3.json",
-  hair1: "短发1.exp3.json",
-  hair2: "短发2.exp3.json",
-};
 
 const canvas = document.getElementById("stage");
 const bubbleEl = document.getElementById("bubble");
@@ -34,14 +14,16 @@ let chatReactTimer = null;
 
 let app = null;
 let model = null;
+let modelConfig = null;
 let currentState = "idle";
 let EXPR_DATA = {};
-let activeExpression = null;
-let prevExpression = null;
+let activeFace = null;
+let activePose = null;
 let exprFade = 0;
-let frameCount = 0;
-let lastReportedFrame = -1;
+let manualExpression = null;
 let motionActive = "idle";
+let presetMotion = null;
+let manualMotion = null;
 let motionClock = 0;
 let transitionT = 1;
 let eyeTargetX = 0;
@@ -56,6 +38,8 @@ let headKnown = false;
 let baseScale = 1;
 let currentScale = 1;
 let baseBounds = null;
+let frameCount = 0;
+let lastReportedFrame = -1;
 
 function clamp(v, lo, hi) {
   return Math.max(lo, Math.min(hi, v));
@@ -65,9 +49,138 @@ function easeInOut(t) {
   return t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
 }
 
-// Custom motion engine: drives parameters directly, so animations work
-// even when the renderer library fails to load the model's motion files.
+// ---------- model config helpers ----------
+
+function exprFile(key) {
+  const map = (modelConfig && modelConfig.expressions) || {};
+  const info = map[key];
+  if (!info) return null;
+  return typeof info === "string" ? info : info.file;
+}
+
+function presetFor(state) {
+  return (
+    (modelConfig && modelConfig.presets && modelConfig.presets[state]) || {}
+  );
+}
+
+function chatPresetFor(emotion) {
+  return (
+    (modelConfig && modelConfig.chat && modelConfig.chat[emotion]) || {}
+  );
+}
+
+function defaultFaceFor(state) {
+  switch (state) {
+    case "idle":
+      return "heart";
+    case "thinking":
+      return "star";
+    case "working":
+      return "swirl";
+    case "fault":
+      return "black";
+    case "interact":
+      return "heart";
+    default:
+      return null;
+  }
+}
+
+function statusStateName(name) {
+  return (
+    name === "idle" ||
+    name === "thinking" ||
+    name === "working" ||
+    name === "completed" ||
+    name === "fault"
+  );
+}
+
+// ---------- rendering helpers ----------
+
+function setParam(id, value) {
+  if (!model || !model.internalModel || !model.internalModel.coreModel) return;
+  try {
+    model.internalModel.coreModel.setParameterValueById(id, value);
+  } catch (e) {
+    /* ignore unknown parameters */
+  }
+}
+
+function stopAllMotions() {
+  try {
+    if (model.motionManager) model.motionManager.stopAllMotions();
+  } catch (e) {}
+  try {
+    if (model.internalModel && model.internalModel.motionManager) {
+      model.internalModel.motionManager.stopAllMotions();
+    }
+  } catch (e) {}
+}
+
+function startNativeMotion(group) {
+  if (!group || !model || !model.motion) return;
+  try {
+    model.motion(group);
+  } catch (e) {
+    /* group missing -> ignore */
+  }
+}
+
+function applyEffects() {
+  const effects = (modelConfig && modelConfig.effects) || {};
+  for (const key of Object.keys(effects)) {
+    const params = EXPR_DATA[key];
+    if (!params) continue;
+    for (const p of params) setParam(p.id, p.value);
+  }
+}
+
+function applyExpressionTarget(face, pose) {
+  face = face && EXPR_DATA[face] ? face : null;
+  pose = pose && EXPR_DATA[pose] ? pose : null;
+  if (face === activeFace && pose === activePose && exprFade > 0.01) return;
+  // 先把所有非固定表情参数归零，避免残留（尤其是黑脸）。
+  const effects = (modelConfig && modelConfig.effects) || {};
+  for (const [key, params] of Object.entries(EXPR_DATA)) {
+    if (effects[key]) continue;
+    for (const p of params) setParam(p.id, 0);
+  }
+  applyEffects();
+  activeFace = face;
+  activePose = pose;
+  exprFade = 0;
+}
+
+// ---------- motion: preset (native) or custom engine ----------
+
+function applyCurrentMotion() {
+  const pres = presetFor(currentState);
+  const group = pres.motion || null;
+  motionClock = 0;
+  manualMotion = null;
+  if (group) {
+    presetMotion = group;
+    motionActive = "preset";
+    startNativeMotion(group);
+  } else {
+    presetMotion = null;
+    motionActive =
+      currentState === "completed" || currentState === "interact"
+        ? "wave"
+        : currentState === "thinking"
+        ? "thinking"
+        : currentState === "working"
+        ? "working"
+        : "idle";
+  }
+}
+
+// Custom motion engine: drives parameters directly, so actions work even
+// when a model has no preset motion files for that state.
 function applyMotion(dt) {
+  if (motionActive === "preset") return;
   motionClock += dt;
   const t = motionClock;
   if (motionActive === "wave") {
@@ -163,7 +276,7 @@ function applyMotion(dt) {
 
 // Gentle transition played when switching between states.
 function applyTransition(dt) {
-  if (transitionT >= 1) return;
+  if (transitionT >= 1 || motionActive === "preset") return;
   transitionT = Math.min(1, transitionT + dt / 0.7);
   const cm = model.internalModel.coreModel;
   const g = (id) => cm.getParameterValueById(id);
@@ -176,86 +289,30 @@ function applyTransition(dt) {
   setParam("Paramdown1", g("Paramdown1") + k * 0.08 * amp);
 }
 
-function setParam(id, value) {
-  if (!model || !model.internalModel || !model.internalModel.coreModel) return;
-  try {
-    model.internalModel.coreModel.setParameterValueById(id, value);
-  } catch (e) {
-    /* ignore unknown parameters */
-  }
-}
-
-function stopAllMotions() {
-  try {
-    if (model.motionManager) model.motionManager.stopAllMotions();
-  } catch (e) {}
-  try {
-    if (model.internalModel && model.internalModel.motionManager) {
-      model.internalModel.motionManager.stopAllMotions();
-    }
-  } catch (e) {}
-}
-
-function statusExpressionFor(state) {
-  switch (state) {
-    case "idle":
-      return "heart";
-    case "thinking":
-      return "star";
-    case "working":
-      return "swirl";
-    case "fault":
-      return "black";
-    case "interact":
-      return "heart";
-    case "completed":
-      return null;
-    default:
-      return null;
-  }
-}
-
-let manualExpression = null;
-
-function applyExpressionTarget(name) {
-  name = name && name !== "none" ? name : null;
-  if (name === activeExpression && exprFade > 0.01) return;
-  // 切换前把所有表情参数归零，保证不会残留上一个表情（尤其是黑脸）。
-  for (const params of Object.values(EXPR_DATA)) {
-    for (const p of params) setParam(p.id, 0);
-  }
-  prevExpression = null;
-  activeExpression = name;
-  exprFade = 0;
-}
+// ---------- state / expression ----------
 
 function setPetState(name) {
   const prevState = currentState;
   currentState = name;
-  motionActive =
-    name === "completed" || name === "interact"
-      ? "wave"
-      : name === "thinking"
-      ? "thinking"
-      : name === "working"
-      ? "working"
-      : "idle";
-  motionClock = 0;
-  // 状态类表情（待机/思考/执行/完成/故障）永远优先：
-  // 一旦状态切换，手动表情自动让位并还原，避免表情（如黑脸）被一直锁住。
-  const statusState =
-    name === "idle" ||
-    name === "thinking" ||
-    name === "working" ||
-    name === "completed" ||
-    name === "fault";
-  if (statusState && name !== prevState) {
+  const pres = presetFor(name);
+  // 状态类表情永远优先：状态切换后手动表情自动让位并还原。
+  if (statusStateName(name) && name !== prevState) {
     manualExpression = null;
   }
-  // 故障状态强制显示黑脸，不受手动表情影响；结束后自动还原。
-  const target =
-    name === "fault" ? "black" : manualExpression || statusExpressionFor(name);
-  applyExpressionTarget(target);
+  let face;
+  let pose;
+  if (name === "fault") {
+    // 故障强制黑脸，不受手动表情影响；结束后自动还原。
+    face = "black";
+    pose = pres.pose || null;
+  } else {
+    face =
+      manualExpression ||
+      (pres.face !== undefined ? pres.face : defaultFaceFor(name));
+    pose = pres.pose || null;
+  }
+  applyExpressionTarget(face, pose);
+  applyCurrentMotion();
   transitionT = 0;
   if (name === "thinking") showBubble("思考中…", 2600);
   else if (name === "working") showBubble("执行命令…", 2600);
@@ -268,7 +325,75 @@ function setPetState(name) {
 
 function setExpression(name) {
   manualExpression = name && name !== "none" ? name : null;
-  applyExpressionTarget(manualExpression || statusExpressionFor(currentState));
+  const pres = presetFor(currentState);
+  const face =
+    currentState === "fault"
+      ? "black"
+      : manualExpression ||
+        (pres.face !== undefined ? pres.face : defaultFaceFor(currentState));
+  applyExpressionTarget(face, pres.pose || null);
+}
+
+function playMotion(group) {
+  if (!group || !model) return;
+  manualMotion = group;
+  presetMotion = null;
+  motionActive = "preset";
+  motionClock = 0;
+  startNativeMotion(group);
+}
+
+function stopMotion() {
+  stopAllMotions();
+  manualMotion = null;
+  applyCurrentMotion();
+}
+
+// ---------- chat ----------
+
+function chatReact(emotion) {
+  if (chatReactTimer) clearTimeout(chatReactTimer);
+  if (window.__bridge) window.__bridge.set_diag("chatReact:" + emotion);
+  const prevState = currentState;
+  const generic = {
+    happy: { face: "heart" },
+    sad: { face: "tear" },
+    angry: { face: "black" },
+    thinking: { face: "star" },
+    surprised: { face: "swirl" },
+    neutral: { face: "heart" },
+  };
+  const m = chatPresetFor(emotion);
+  const base = generic[emotion] || generic.neutral;
+  const faceKey =
+    m.face !== undefined ? m.face : base.face;
+  const poseKey = m.pose || null;
+  const motionMap = {
+    happy: "wave",
+    sad: "sad",
+    angry: "angry",
+    thinking: "thinking",
+    surprised: "surprised",
+    neutral: "nod",
+  };
+  currentState = "chat-" + emotion;
+  applyExpressionTarget(faceKey, poseKey);
+  motionActive = motionMap[emotion] || "nod";
+  presetMotion = null;
+  manualMotion = null;
+  motionClock = 0;
+  transitionT = 0;
+  chatReactTimer = setTimeout(() => {
+    currentState = prevState;
+    applyExpressionTarget(
+      presetFor(prevState).face !== undefined
+        ? presetFor(prevState).face
+        : defaultFaceFor(prevState),
+      presetFor(prevState).pose || null
+    );
+    applyCurrentMotion();
+    transitionT = 0;
+  }, 8000);
 }
 
 function showBubble(text, ms) {
@@ -292,31 +417,6 @@ function showChatReply(text, ms) {
   showBubble(text, ms || 6000);
 }
 
-function chatReact(emotion) {
-  if (chatReactTimer) clearTimeout(chatReactTimer);
-  if (window.__bridge) window.__bridge.set_diag("chatReact:" + emotion);
-  const map = {
-    happy: { motion: "wave", expr: "heart" },
-    sad: { motion: "sad", expr: "tear" },
-    angry: { motion: "angry", expr: "black" },
-    thinking: { motion: "thinking", expr: "star" },
-    surprised: { motion: "surprised", expr: "swirl" },
-    neutral: { motion: "nod", expr: "heart" },
-  };
-  const m = map[emotion] || map.neutral;
-  currentState = "chat-" + emotion;
-  motionActive = m.motion;
-  motionClock = 0;
-  applyExpressionTarget(m.expr);
-  transitionT = 0;
-  chatReactTimer = setTimeout(() => {
-    motionActive = "idle";
-    motionClock = 0;
-    applyExpressionTarget("heart");
-    transitionT = 0;
-  }, 8000);
-}
-
 function sendChat() {
   const text = chatInputEl.value.trim();
   if (!text || !window.__bridge) return;
@@ -324,6 +424,8 @@ function sendChat() {
   showBubble("…", 60000);
   window.__bridge.send_chat(text);
 }
+
+// ---------- layout ----------
 
 function computeHeadRef() {
   if (!model) return;
@@ -353,10 +455,7 @@ function reportHead() {
   const cw = window.innerWidth;
   const ch = window.innerHeight;
   if (window.__bridge && cw > 0 && ch > 0) {
-    window.__bridge.set_head(
-      headX / cw,
-      headY / ch
-    );
+    window.__bridge.set_head(headX / cw, headY / ch);
   }
 }
 
@@ -368,15 +467,17 @@ function reportDiag() {
         error: window.__error || null,
         bridge: !!window.__bridge,
         model: !!model,
+        modelId: modelConfig ? modelConfig.id : null,
         expCount: Object.keys(EXPR_DATA).length,
-        events: typeof canvas.addEventListener === "function",
         frameCount: frameCount,
         expr: {
           state: currentState,
-          active: activeExpression,
+          face: activeFace,
+          pose: activePose,
           manual: manualExpression,
           fade: +exprFade.toFixed(3),
         },
+        motion: { active: motionActive, preset: presetMotion, manual: manualMotion },
       })
     );
   }
@@ -411,11 +512,18 @@ function fitModel() {
 }
 
 function measureBounds() {
-  const motions = ["Idle", "Tap"];
+  const motions = ((modelConfig && modelConfig.motions) || []).map(
+    (m) => m.group
+  );
+  const groups = motions.length ? motions : ["Idle"];
   let union = null;
-  for (const m of motions) {
+  for (const m of groups) {
     stopAllMotions();
-    model.motion(m);
+    try {
+      model.motion(m);
+    } catch (e) {
+      continue;
+    }
     for (let i = 0; i < 45; i++) {
       model.update(1 / 20);
       const b = model.getBounds();
@@ -432,11 +540,11 @@ function measureBounds() {
     }
   }
   stopAllMotions();
-  model.motion("Idle");
   baseBounds = union
     ? { w: union.x2 - union.x, h: union.y2 - union.y }
     : { w: 440, h: 700 };
   reportBounds();
+  applyCurrentMotion();
   reposition();
 }
 
@@ -453,6 +561,8 @@ function setScale(s) {
   }
   reposition();
 }
+
+// ---------- main loop ----------
 
 function onFrame(ts) {
   requestAnimationFrame(onFrame);
@@ -485,41 +595,80 @@ function onFrame(ts) {
   applyTransition(dt);
 
   // Expressions: fade in/out the parameter values ourselves.
-  if (prevExpression || activeExpression) {
+  if (activeFace || activePose) {
     exprFade = Math.min(1, exprFade + dt / 0.4);
-    const out = activeExpression ? 1 - exprFade : 0;
-    const inp = activeExpression ? exprFade : 0;
-    if (prevExpression && out > 0 && EXPR_DATA[prevExpression]) {
-      for (const p of EXPR_DATA[prevExpression]) {
-        setParam(p.id, p.value * out);
-      }
+    const inp = exprFade;
+    for (const key of [activeFace, activePose]) {
+      const params = key && EXPR_DATA[key];
+      if (!params) continue;
+      for (const p of params) setParam(p.id, p.value * inp);
     }
-    if (activeExpression && inp > 0 && EXPR_DATA[activeExpression]) {
-      for (const p of EXPR_DATA[activeExpression]) {
-        setParam(p.id, p.value * inp);
-      }
-    }
-    if (exprFade >= 1) prevExpression = null;
   }
 
   app.render();
 }
 
+// ---------- model loading ----------
+
+function modelUrl(cfg, relPath) {
+  const base = MODEL_ROOT + encodeURIComponent(cfg.id) + "/";
+  return (
+    base +
+    String(relPath)
+      .split("/")
+      .map((seg) => encodeURIComponent(seg))
+      .join("/")
+  );
+}
+
 async function loadExpressions() {
+  const map = Object.assign(
+    {},
+    (modelConfig && modelConfig.expressions) || {},
+    (modelConfig && modelConfig.effects) || {}
+  );
   const entries = await Promise.all(
-    Object.entries(EXPR_FILES).map(async ([name, file]) => {
-      const resp = await fetch(
-        "/model/yumi/" + encodeURIComponent(file)
-      );
+    Object.entries(map).map(async ([key, info]) => {
+      const file = typeof info === "string" ? info : info.file;
+      const resp = await fetch(modelUrl(modelConfig, file));
       const obj = await resp.json();
       const params = (obj.Parameters || []).map((p) => ({
         id: p.Id,
         value: p.Value,
       }));
-      return [name, params];
+      return [key, params];
     })
   );
   EXPR_DATA = Object.fromEntries(entries);
+  applyEffects();
+}
+
+async function loadModel(cfg) {
+  modelConfig = cfg;
+  if (model) {
+    try {
+      model.destroy();
+    } catch (e) {}
+    model = null;
+  }
+  EXPR_DATA = {};
+  activeFace = null;
+  activePose = null;
+  manualExpression = null;
+  manualMotion = null;
+  presetMotion = null;
+  motionActive = "idle";
+  model = await PIXI.live2d.Live2DModel.from(modelUrl(cfg, cfg.model3), {
+    autoInteract: false,
+    motionPreload: "NONE",
+  });
+  app.stage.addChild(model);
+  await loadExpressions();
+  fitModel();
+  baseScale = model.scale.x;
+  setPetState(currentState);
+  setTimeout(() => measureBounds(), 150);
+  reportDiag();
 }
 
 function setupEvents() {
@@ -547,6 +696,24 @@ window.setEye = (x, y) => {
   eyeTargetX = clamp(x, -1, 1);
   eyeTargetY = clamp(y, -1, 1);
 };
+window.setModelConfig = (cfg) => {
+  if (!modelConfig && cfg && cfg.model3) {
+    modelConfig = cfg;
+  }
+};
+window.switchModel = async (id) => {
+  if (!id) return;
+  try {
+    const resp = await fetch(modelUrl({ id: id }, "model.json"));
+    const cfg = await resp.json();
+    if (!cfg || !cfg.model3) return;
+    await loadModel(cfg);
+  } catch (err) {
+    window.__error = String(err && err.stack ? err.stack : err);
+  }
+};
+window.playMotion = playMotion;
+window.stopMotion = stopMotion;
 window.setPetState = setPetState;
 window.setExpression = setExpression;
 window.setChatMode = setChatMode;
@@ -591,16 +758,20 @@ async function init() {
   setupEvents();
   connectBridge();
 
-  model = await PIXI.live2d.Live2DModel.from(MODEL_URL, {
-    autoInteract: false,
-    motionPreload: "NONE",
-  });
-  app.stage.addChild(model);
-  await loadExpressions();
-  fitModel();
-  baseScale = model.scale.x;
-  model.motion("Idle");
-  setTimeout(() => measureBounds(), 150);
+  // Wait for the model config pushed from Python (may take a moment).
+  const deadline = Date.now() + 12000;
+  while (!modelConfig) {
+    if (Date.now() > deadline) break;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  if (!modelConfig) {
+    window.__ready = true;
+    window.__error = "no model config";
+    reportDiag();
+    return;
+  }
+
+  await loadModel(modelConfig);
   requestAnimationFrame(onFrame);
   window.__ready = true;
   setTimeout(reportDiag, 400);

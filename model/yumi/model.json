@@ -1,0 +1,44 @@
+{
+  "id": "yumi",
+  "name": "yumi",
+  "model3": "yumi.model3.json",
+  "motions": [
+    { "key": "idle", "group": "Idle", "label": "待机动作" },
+    { "key": "wave", "group": "Tap", "label": "挥手" }
+  ],
+  "expressions": {
+    "heart":    { "file": "爱心眼.exp3.json", "label": "爱心眼" },
+    "star":     { "file": "星星眼.exp3.json", "label": "星星眼" },
+    "tear":     { "file": "眼泪.exp3.json", "label": "眼泪" },
+    "teary":    { "file": "泪汪汪.exp3.json", "label": "泪汪汪" },
+    "wry":      { "file": "歪嘴.exp3.json", "label": "歪嘴" },
+    "catmouth": { "file": "猫猫嘴.exp3.json", "label": "猫猫嘴" },
+    "eyepatch": { "file": "眼罩.exp3.json", "label": "眼罩" },
+    "black":    { "file": "黑脸.exp3.json", "label": "黑脸" },
+    "swirl":    { "file": "蚊香眼.exp3.json", "label": "蚊香眼" },
+    "tongue":   { "file": "舌头伸出.exp3.json", "label": "舌头伸出" },
+    "mic":      { "file": "拿话筒.exp3.json", "label": "拿话筒" },
+    "bend":     { "file": "俯身按键.exp3.json", "label": "俯身按键" },
+    "raiseL":   { "file": "抬手左.exp3.json", "label": "抬手左" },
+    "raiseR":   { "file": "抬手右.exp3.json", "label": "抬手右" },
+    "dog":      { "file": "漂浮小狗.exp3.json", "label": "漂浮小狗" },
+    "hair1":    { "file": "短发1.exp3.json", "label": "短发1" },
+    "hair2":    { "file": "短发2.exp3.json", "label": "短发2" }
+  },
+  "effects": {},
+  "presets": {
+    "idle":      { "motion": "Idle", "face": "heart" },
+    "thinking":  { "face": "star" },
+    "working":   { "face": "swirl" },
+    "fault":     { "face": "black" },
+    "completed": {}
+  },
+  "chat": {
+    "happy":     { "face": "heart" },
+    "sad":       { "face": "tear" },
+    "angry":     { "face": "black" },
+    "thinking":  { "face": "star" },
+    "surprised": { "face": "swirl" },
+    "neutral":   { "face": "heart" }
+  }
+}

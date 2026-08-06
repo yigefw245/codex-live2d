@@ -47,7 +47,45 @@ DEFAULT_SETTINGS = {
     "pos_x": None,
     "pos_y": None,
     "locked": True,
+    "model": "yumi",
 }
+
+
+MODEL_DIR = os.path.join(BASE_DIR, "model")
+
+
+def list_models():
+    models = []
+    try:
+        for entry in sorted(os.listdir(MODEL_DIR)):
+            cfg_path = os.path.join(MODEL_DIR, entry, "model.json")
+            if not os.path.isfile(cfg_path):
+                continue
+            try:
+                with open(cfg_path, encoding="utf-8") as f:
+                    cfg = json.load(f)
+                models.append(
+                    {
+                        "id": cfg.get("id", entry),
+                        "name": cfg.get("name", entry),
+                    }
+                )
+            except Exception:
+                pass
+    except OSError:
+        pass
+    return models
+
+
+def load_model_config(model_id):
+    try:
+        with open(
+            os.path.join(MODEL_DIR, model_id, "model.json"),
+            encoding="utf-8",
+        ) as f:
+            return json.load(f)
+    except Exception:
+        return None
 
 
 def load_pet_size():
@@ -324,26 +362,6 @@ class PetBridge(QObject):
 
 
 class PetWindow(QWidget):
-    EXPRESSIONS = [
-        ("爱心眼", "heart"),
-        ("星星眼", "star"),
-        ("眼泪", "tear"),
-        ("泪汪汪", "teary"),
-        ("歪嘴", "wry"),
-        ("猫猫嘴", "catmouth"),
-        ("眼罩", "eyepatch"),
-        ("黑脸", "black"),
-        ("蚊香眼", "swirl"),
-        ("舌头伸出", "tongue"),
-        ("拿话筒", "mic"),
-        ("俯身按键", "bend"),
-        ("抬手左", "raiseL"),
-        ("抬手右", "raiseR"),
-        ("漂浮小狗", "dog"),
-        ("短发1", "hair1"),
-        ("短发2", "hair2"),
-    ]
-
     chat_reply = Signal(str)
 
     def __init__(self):
@@ -355,6 +373,11 @@ class PetWindow(QWidget):
         self.setAttribute(Qt.WA_NoSystemBackground)
 
         self.settings = load_settings()
+        self.models = list_models()
+        self.model_id = str(self.settings.get("model", "yumi"))
+        if not any(m["id"] == self.model_id for m in self.models):
+            self.model_id = "yumi"
+        self.model_cfg = load_model_config(self.model_id) or {}
         self.scale = max(
             MIN_SCALE,
             min(MAX_SCALE, float(self.settings.get("scale", 1.0))),
@@ -494,12 +517,52 @@ class PetWindow(QWidget):
                 f.write(f"{time.ctime()} live page failed to load\n")
 
     def sync_page_state(self):
+        self._run_js(
+            f"window.setModelConfig({json.dumps(self.model_cfg, ensure_ascii=False)})"
+        )
         self._run_js(f"window.setPetState({json.dumps(self.state)})")
         self._run_js(f"window.setScale({self.scale})")
 
     def set_state(self, name):
         self.state = name
         self._run_js(f"window.setPetState({json.dumps(name)})")
+
+    def switch_model(self, model_id):
+        if model_id == self.model_id:
+            return
+        cfg = load_model_config(model_id)
+        if not cfg:
+            return
+        self.model_id = model_id
+        self.model_cfg = cfg
+        self.settings["model"] = model_id
+        save_settings(self.settings)
+        self.current_expression = None
+        # 整页重载，让 QtWebEngine 以全新上下文加载新模型，避免原地换模型卡死。
+        self.view.reload()
+
+    def play_motion(self, group):
+        self._run_js(f"window.playMotion({json.dumps(group)})")
+
+    def stop_motion(self):
+        self._run_js("window.stopMotion()")
+
+    def restore_defaults(self):
+        self.settings = dict(DEFAULT_SETTINGS)
+        save_settings(self.settings)
+        self.model_id = "yumi"
+        self.model_cfg = load_model_config("yumi") or {}
+        self.scale = 1.0
+        self.locked = True
+        self.current_expression = None
+        self.chat_mode = False
+        self._run_js("window.setChatMode(false)")
+        self.apply_geometry()
+        self.move_to_saved_position()
+        self.view.resize(self.width(), self.height())
+        self._run_js(f"window.setScale({self.scale})")
+        self.set_state("idle")
+        self.view.reload()
 
     def handle_chat(self, text):
         text = " ".join(str(text).split())
@@ -632,8 +695,36 @@ class PetWindow(QWidget):
     def show_menu(self):
         try:
             menu = QMenu(self)
+            model_menu = menu.addMenu("模型")
+            for m in self.models:
+                action = QAction(m["name"], self, checkable=True)
+                action.setChecked(m["id"] == self.model_id)
+                action.triggered.connect(
+                    lambda checked=False, mid=m["id"]: self.switch_model(mid)
+                )
+                model_menu.addAction(action)
+
+            motion_menu = menu.addMenu("动作")
+            motions = self.model_cfg.get("motions") or []
+            if motions:
+                for m in motions:
+                    label = m.get("label") or m.get("group")
+                    action = QAction(label, self)
+                    action.triggered.connect(
+                        lambda checked=False, g=m["group"]: self.play_motion(g)
+                    )
+                    motion_menu.addAction(action)
+            motion_menu.addAction(
+                QAction("停止动作", self, triggered=self.stop_motion)
+            )
+
             exp_menu = menu.addMenu("表情")
-            for label, key in self.EXPRESSIONS:
+            expressions = self.model_cfg.get("expressions") or {}
+            for key, info in expressions.items():
+                if isinstance(info, dict):
+                    label = info.get("label", key)
+                else:
+                    label = key
                 action = QAction(label, self, checkable=True)
                 action.setChecked(self.current_expression == key)
                 action.triggered.connect(
@@ -648,7 +739,7 @@ class PetWindow(QWidget):
             menu.addSeparator()
             menu.addAction(
                 QAction(
-                    "放松（爱心眼）",
+                    "放松",
                     self,
                     triggered=lambda: self.set_pet_state("idle"),
                 )
@@ -671,6 +762,14 @@ class PetWindow(QWidget):
             menu.addSeparator()
             menu.addAction(QAction("放大", self, triggered=self.scale_up))
             menu.addAction(QAction("缩小", self, triggered=self.scale_down))
+            menu.addSeparator()
+            menu.addAction(
+                QAction(
+                    "恢复默认设置和模型",
+                    self,
+                    triggered=self.restore_defaults,
+                )
+            )
             menu.addSeparator()
             menu.addAction(QAction("退出", self, triggered=self.quit_pet))
             menu.exec(QCursor.pos())
