@@ -16,6 +16,7 @@ let app = null;
 let model = null;
 let modelConfig = null;
 let currentState = "idle";
+let actionOverrides = {};
 let EXPR_DATA = {};
 let activeFace = null;
 let activePose = null;
@@ -68,6 +69,42 @@ function chatPresetFor(emotion) {
   return (
     (modelConfig && modelConfig.chat && modelConfig.chat[emotion]) || {}
   );
+}
+
+function exprKind(key) {
+  const map = (modelConfig && modelConfig.expressions) || {};
+  const info = map[key];
+  if (info && typeof info === "object" && info.kind) return info.kind;
+  return "face";
+}
+
+// 状态动作解析：手动指定优先；未指定 / 指定项不存在时回退默认配置。
+function resolveStatusAction(name) {
+  const ov = actionOverrides[name] || {};
+  const pres = presetFor(name);
+  const auto = {
+    motion: pres.motion || null,
+    pose: pres.pose || null,
+    face: pres.face !== undefined ? pres.face : defaultFaceFor(name),
+  };
+  if (!ov.type || ov.type === "auto") return auto;
+  if (ov.type === "none") return { motion: null, pose: null, face: null };
+  if (ov.type === "motion") {
+    const ok = ((modelConfig && modelConfig.motions) || []).some(
+      (m) => m.group === ov.key
+    );
+    return ok
+      ? { motion: ov.key, pose: auto.pose, face: auto.face }
+      : auto;
+  }
+  if (ov.type === "expr") {
+    if (!EXPR_DATA[ov.key]) return auto;
+    if (exprKind(ov.key) === "pose") {
+      return { motion: auto.motion, pose: ov.key, face: auto.face };
+    }
+    return { motion: auto.motion, pose: auto.pose, face: ov.key };
+  }
+  return auto;
 }
 
 function defaultFaceFor(state) {
@@ -155,32 +192,49 @@ function applyExpressionTarget(face, pose) {
 
 // ---------- motion: preset (native) or custom engine ----------
 
-function applyCurrentMotion() {
-  const pres = presetFor(currentState);
-  const group = pres.motion || null;
-  motionClock = 0;
+// 应用某个状态的外观（动作 + 姿势 + 表情），不弹气泡。
+function applyStateVisuals(name) {
+  const act = resolveStatusAction(name);
+  let face = manualExpression || act.face;
+  let pose = act.pose;
+  // 故障在未手动覆盖时强制黑脸。
+  if (name === "fault" && !(actionOverrides[name] || {}).type) {
+    face = "black";
+    pose = null;
+  }
+  applyExpressionTarget(face, pose);
+  const group = act.motion;
   manualMotion = null;
-  if (group) {
+  motionClock = 0;
+  if ((actionOverrides[name] || {}).type === "none") {
+    motionActive = "none";
+    presetMotion = null;
+  } else if (group) {
     presetMotion = group;
     motionActive = "preset";
     startNativeMotion(group);
   } else {
     presetMotion = null;
     motionActive =
-      currentState === "completed" || currentState === "interact"
+      name === "completed" || name === "interact"
         ? "wave"
-        : currentState === "thinking"
+        : name === "thinking"
         ? "thinking"
-        : currentState === "working"
+        : name === "working"
         ? "working"
         : "idle";
   }
+  transitionT = 0;
+}
+
+function applyCurrentMotion() {
+  applyStateVisuals(currentState);
 }
 
 // Custom motion engine: drives parameters directly, so actions work even
 // when a model has no preset motion files for that state.
 function applyMotion(dt) {
-  if (motionActive === "preset") return;
+  if (motionActive === "preset" || motionActive === "none") return;
   motionClock += dt;
   const t = motionClock;
   if (motionActive === "wave") {
@@ -294,26 +348,11 @@ function applyTransition(dt) {
 function setPetState(name) {
   const prevState = currentState;
   currentState = name;
-  const pres = presetFor(name);
   // 状态类表情永远优先：状态切换后手动表情自动让位并还原。
   if (statusStateName(name) && name !== prevState) {
     manualExpression = null;
   }
-  let face;
-  let pose;
-  if (name === "fault") {
-    // 故障强制黑脸，不受手动表情影响；结束后自动还原。
-    face = "black";
-    pose = pres.pose || null;
-  } else {
-    face =
-      manualExpression ||
-      (pres.face !== undefined ? pres.face : defaultFaceFor(name));
-    pose = pres.pose || null;
-  }
-  applyExpressionTarget(face, pose);
-  applyCurrentMotion();
-  transitionT = 0;
+  applyStateVisuals(name);
   if (name === "thinking") showBubble("思考中…", 2600);
   else if (name === "working") showBubble("执行命令…", 2600);
   else if (name === "completed") showBubble("完成！", 2600);
@@ -325,13 +364,7 @@ function setPetState(name) {
 
 function setExpression(name) {
   manualExpression = name && name !== "none" ? name : null;
-  const pres = presetFor(currentState);
-  const face =
-    currentState === "fault"
-      ? "black"
-      : manualExpression ||
-        (pres.face !== undefined ? pres.face : defaultFaceFor(currentState));
-  applyExpressionTarget(face, pres.pose || null);
+  applyStateVisuals(currentState);
 }
 
 function playMotion(group) {
@@ -385,14 +418,7 @@ function chatReact(emotion) {
   transitionT = 0;
   chatReactTimer = setTimeout(() => {
     currentState = prevState;
-    applyExpressionTarget(
-      presetFor(prevState).face !== undefined
-        ? presetFor(prevState).face
-        : defaultFaceFor(prevState),
-      presetFor(prevState).pose || null
-    );
-    applyCurrentMotion();
-    transitionT = 0;
+    applyStateVisuals(prevState);
   }, 8000);
 }
 
@@ -701,6 +727,10 @@ window.setModelConfig = (cfg) => {
     modelConfig = cfg;
   }
 };
+window.setActionOverrides = (obj) => {
+  actionOverrides = obj || {};
+  if (model && modelConfig) applyStateVisuals(currentState);
+};
 window.switchModel = async (id) => {
   if (!id) return;
   try {
@@ -716,6 +746,7 @@ window.playMotion = playMotion;
 window.stopMotion = stopMotion;
 window.setPetState = setPetState;
 window.setExpression = setExpression;
+window.notify = showBubble;
 window.setChatMode = setChatMode;
 window.showChatReply = showChatReply;
 window.chatReact = chatReact;

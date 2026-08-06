@@ -2,11 +2,14 @@ import atexit
 import ctypes
 import json
 import os
+import re
+import shutil
 import sys
 import threading
 import time
 import urllib.error
 import urllib.request
+import zipfile
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 from PySide6.QtCore import QObject, QTimer, QUrl, Qt, Signal, Slot
@@ -15,6 +18,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QFormLayout,
     QLineEdit,
     QMenu,
@@ -48,6 +52,7 @@ DEFAULT_SETTINGS = {
     "pos_y": None,
     "locked": True,
     "model": "yumi",
+    "actions": {},
 }
 
 
@@ -86,6 +91,175 @@ def load_model_config(model_id):
             return json.load(f)
     except Exception:
         return None
+
+
+def model_actions(settings, model_id):
+    """当前模型的手动动作设置（用于同步到前端）。"""
+    actions = settings.get("actions") or {}
+    return actions.get(model_id) or {}
+
+
+def sanitize_model_id(name):
+    name = str(name or "").strip()
+    cleaned = re.sub(r"[^A-Za-z0-9_-]", "", name)
+    return cleaned or "model"
+
+
+def unique_model_id(base):
+    model_id = sanitize_model_id(base)
+    candidate = model_id
+    n = 1
+    while os.path.isdir(os.path.join(MODEL_DIR, candidate)):
+        n += 1
+        candidate = f"{model_id}_{n}"
+    return candidate
+
+
+def _expr_classify(name):
+    """按文件名关键词把表情映射为 key / kind / 是否固定效果。"""
+    name = str(name)
+    if "水印" in name or "watermark" in name.lower():
+        return "watermark", "effect", True
+    if any(w in name for w in ("隐藏", "hide")):
+        return "hide", "pose", False
+    for key, words in (
+        ("star", ("星星", "星光", "星眼", "star")),
+        ("heart", ("爱心", "heart")),
+        ("swirl", ("蚊香", "晕晕", "眩晕", "swirl", "dizzy")),
+        ("black", ("黑脸", "黑面", "black")),
+        ("tear", ("眼泪", "流泪", "tear")),
+        ("cry", ("哭哭", "哭泣", "大哭", "cry")),
+        ("teary", ("泪汪汪", "泪眼", "teary")),
+        ("blush", ("脸红", "害羞", "blush")),
+        ("hand", ("扶脸", "托腮", "思考", "hand")),
+        ("notes", ("笔记", "写字", "书写", "notes")),
+        ("phone", ("手机", "看手机", "phone")),
+        ("lean", ("前倾", "俯身", "lean")),
+        ("fly", ("飞头", "飞头", "fly")),
+        ("wry", ("歪嘴", "wry")),
+        ("tongue", ("舌头", "吐舌", "tongue")),
+        ("raiseL", ("抬手左", "举左手", "raiseL", "left")),
+        ("raiseR", ("抬手右", "举右手", "raiseR", "right")),
+        ("mic", ("话筒", "麦克风", "mic")),
+        ("dog", ("小狗", "漂浮小狗", "dog")),
+        ("hair", ("短发", "发型", "hair")),
+    ):
+        if any(w in name for w in words):
+            return key, "face", False
+    return None, "face", False
+
+
+def build_model_config(model_dir, model3_rel, display_name, model_id):
+    """扫描模型目录，自动生成 model.json 配置。"""
+    expressions = {}
+    effects = {}
+    poses = []
+    hide_count = 0
+    expr_count = 0
+    motion_files = []
+    for root, _dirs, files in os.walk(model_dir):
+        for fname in files:
+            rel = os.path.relpath(os.path.join(root, fname), model_dir)
+            rel = rel.replace("\\", "/")
+            if fname.lower().endswith(".exp3.json"):
+                base = os.path.splitext(fname)[0]
+                key, kind, is_effect = _expr_classify(base)
+                if is_effect:
+                    effects["watermark"] = {"file": rel}
+                    continue
+                if key == "hide":
+                    hide_count += 1
+                    key = f"hide{hide_count}"
+                    kind = "pose"
+                if not key:
+                    expr_count += 1
+                    key = f"expr{expr_count}"
+                entry = {"file": rel, "label": base}
+                if kind == "pose":
+                    entry["kind"] = "pose"
+                    poses.append(key)
+                expressions[key] = entry
+            elif fname.lower().endswith(".motion3.json"):
+                motion_files.append(rel)
+
+    # 读取 model3.json 已声明的动作组
+    motions = []
+    patched = False
+    try:
+        m3_path = os.path.join(model_dir, model3_rel)
+        with open(m3_path, encoding="utf-8") as f:
+            m3 = json.load(f)
+        declared = (m3.get("Motions") or {}).items()
+        for group, items in declared:
+            if items:
+                label = group
+                motions.append(
+                    {"key": group.lower(), "group": group, "label": label}
+                )
+        if not motions and motion_files:
+            m3["Motions"] = {
+                "Idle": [
+                    {"File": motion_files[0], "Loop": True}
+                ]
+            }
+            for extra in motion_files[1:]:
+                m3["Motions"][os.path.splitext(os.path.basename(extra))[0]] = [
+                    {"File": extra, "Loop": True}
+                ]
+            with open(m3_path, "w", encoding="utf-8") as f:
+                json.dump(m3, f, ensure_ascii=False, indent=1)
+            motions.append(
+                {
+                    "key": "idle",
+                    "group": "Idle",
+                    "label": os.path.splitext(
+                        os.path.basename(motion_files[0])
+                    )[0],
+                }
+            )
+            patched = True
+    except Exception:
+        pass
+
+    presets = {}
+    if "star" in expressions:
+        presets["thinking"] = {"face": "star"}
+    if "hand" in expressions:
+        presets.setdefault("thinking", {})["pose"] = "hand"
+    if "swirl" in expressions:
+        presets["working"] = {"face": "swirl"}
+    if "notes" in expressions:
+        presets.setdefault("working", {})["pose"] = "notes"
+    if "black" in expressions:
+        presets["fault"] = {"face": "black"}
+    if "heart" in expressions:
+        presets["idle"] = {"face": "heart"}
+    if "star" in expressions:
+        presets["completed"] = {"face": "star"}
+
+    chat = {}
+    for emotion, key in (
+        ("happy", "heart"),
+        ("sad", "tear"),
+        ("angry", "black"),
+        ("thinking", "star"),
+        ("surprised", "swirl"),
+        ("neutral", "heart"),
+    ):
+        if key in expressions:
+            chat[emotion] = {"face": key}
+
+    config = {
+        "id": model_id,
+        "name": display_name,
+        "model3": model3_rel,
+        "motions": motions,
+        "expressions": expressions,
+        "effects": effects,
+        "presets": presets,
+        "chat": chat,
+    }
+    return config, patched
 
 
 def load_pet_size():
@@ -520,6 +694,10 @@ class PetWindow(QWidget):
         self._run_js(
             f"window.setModelConfig({json.dumps(self.model_cfg, ensure_ascii=False)})"
         )
+        self._run_js(
+            f"window.setActionOverrides("
+            f"{json.dumps(model_actions(self.settings, self.model_id), ensure_ascii=False)})"
+        )
         self._run_js(f"window.setPetState({json.dumps(self.state)})")
         self._run_js(f"window.setScale({self.scale})")
 
@@ -538,8 +716,144 @@ class PetWindow(QWidget):
         self.settings["model"] = model_id
         save_settings(self.settings)
         self.current_expression = None
+        self._run_js(
+            f"window.setActionOverrides("
+            f"{json.dumps(model_actions(self.settings, self.model_id), ensure_ascii=False)})"
+        )
         # 整页重载，让 QtWebEngine 以全新上下文加载新模型，避免原地换模型卡死。
         self.view.reload()
+
+    def set_status_action(self, status, choice):
+        actions = self.settings.setdefault("actions", {})
+        per_model = actions.setdefault(self.model_id, {})
+        if choice is None or choice.get("type") == "auto":
+            per_model.pop(status, None)
+        else:
+            per_model[status] = choice
+        if not per_model:
+            actions.pop(self.model_id, None)
+        save_settings(self.settings)
+        self._run_js(
+            f"window.setActionOverrides("
+            f"{json.dumps(per_model, ensure_ascii=False)})"
+        )
+
+    def _default_action_label(self, status):
+        pres = (self.model_cfg.get("presets") or {}).get(status) or {}
+        parts = []
+        motion_labels = {
+            m.get("group"): (m.get("label") or m.get("group"))
+            for m in (self.model_cfg.get("motions") or [])
+        }
+        if pres.get("motion"):
+            parts.append(
+                motion_labels.get(pres["motion"], pres["motion"])
+            )
+        expressions = self.model_cfg.get("expressions") or {}
+        for k in ("pose", "face"):
+            key = pres.get(k)
+            if not key:
+                continue
+            info = expressions.get(key)
+            parts.append(
+                info.get("label", key)
+                if isinstance(info, dict)
+                else key
+            )
+        return " + ".join(parts) if parts else "内置默认动作"
+
+    def import_model_zip(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择 Live2D 模型压缩包",
+            "",
+            "ZIP 压缩包 (*.zip)",
+        )
+        if not path:
+            return
+        base_name = os.path.splitext(os.path.basename(path))[0]
+        model_id = unique_model_id(base_name)
+        dest = os.path.join(MODEL_DIR, model_id)
+        try:
+            with zipfile.ZipFile(path) as zf:
+                names = zf.namelist()
+                dirs = [
+                    n.split("/")[0]
+                    for n in names
+                    if "/" in n and not n.endswith("/")
+                ]
+                strip = dirs[0] + "/" if len(set(dirs)) == 1 else ""
+                os.makedirs(dest, exist_ok=True)
+                for n in names:
+                    if n.endswith("/"):
+                        continue
+                    rel = n[len(strip):] if strip else n
+                    target = os.path.normpath(os.path.join(dest, rel))
+                    if not target.startswith(dest):
+                        continue
+                    os.makedirs(os.path.dirname(target), exist_ok=True)
+                    with open(target, "wb") as f:
+                        f.write(zf.read(n))
+        except Exception:
+            shutil.rmtree(dest, ignore_errors=True)
+            self._notify("导入失败：压缩包无法解析")
+            return
+        self._finish_import(dest, model_id, base_name)
+
+    def import_model_folder(self):
+        path = QFileDialog.getExistingDirectory(
+            self, "选择包含 Live2D 模型的文件夹", ""
+        )
+        if not path:
+            return
+        base_name = os.path.basename(os.path.normpath(path))
+        model_id = unique_model_id(base_name)
+        dest = os.path.join(MODEL_DIR, model_id)
+        try:
+            shutil.copytree(path, dest)
+        except Exception:
+            shutil.rmtree(dest, ignore_errors=True)
+            self._notify("导入失败：无法复制文件夹")
+            return
+        self._finish_import(dest, model_id, base_name)
+
+    def _find_model3(self, model_dir):
+        best = None
+        for root, _dirs, files in os.walk(model_dir):
+            for fname in files:
+                if fname.lower().endswith(".model3.json"):
+                    rel = os.path.relpath(os.path.join(root, fname), model_dir)
+                    rel = rel.replace("\\", "/")
+                    if best is None or len(rel.split("/")) < len(
+                        best.split("/")
+                    ):
+                        best = rel
+        return best
+
+    def _finish_import(self, dest, model_id, display_name):
+        model3_rel = self._find_model3(dest)
+        if not model3_rel:
+            shutil.rmtree(dest, ignore_errors=True)
+            self._notify("导入失败：未找到 model3.json")
+            return
+        try:
+            cfg, _patched = build_model_config(
+                dest, model3_rel, display_name, model_id
+            )
+            with open(
+                os.path.join(dest, "model.json"), "w", encoding="utf-8"
+            ) as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+        except Exception:
+            shutil.rmtree(dest, ignore_errors=True)
+            self._notify("导入失败：配置生成出错")
+            return
+        self.models = list_models()
+        self.switch_model(model_id)
+        self._notify(f"模型导入完成：{display_name}")
+
+    def _notify(self, text):
+        self._run_js(f"window.notify({json.dumps(text)}, 4000)")
 
     def play_motion(self, group):
         self._run_js(f"window.playMotion({json.dumps(group)})")
@@ -703,6 +1017,88 @@ class PetWindow(QWidget):
                     lambda checked=False, mid=m["id"]: self.switch_model(mid)
                 )
                 model_menu.addAction(action)
+            model_menu.addSeparator()
+            model_menu.addAction(
+                QAction(
+                    "导入模型（zip）…",
+                    self,
+                    triggered=self.import_model_zip,
+                )
+            )
+            model_menu.addAction(
+                QAction(
+                    "导入模型（文件夹）…",
+                    self,
+                    triggered=self.import_model_folder,
+                )
+            )
+
+            status_menu = menu.addMenu("状态动作")
+            per_model_actions = model_actions(self.settings, self.model_id)
+            status_list = [
+                ("待机", "idle"),
+                ("思考中", "thinking"),
+                ("执行中", "working"),
+                ("完成", "completed"),
+                ("故障", "fault"),
+                ("点击互动", "interact"),
+            ]
+            expressions = self.model_cfg.get("expressions") or {}
+            for label, status in status_list:
+                sub = status_menu.addMenu(label)
+                cur = per_model_actions.get(status) or {}
+                auto_item = QAction(
+                    f"自动（{self._default_action_label(status)}）",
+                    self,
+                    checkable=True,
+                )
+                auto_item.setChecked(not cur.get("type"))
+                auto_item.triggered.connect(
+                    lambda checked=False, s=status: self.set_status_action(
+                        s, None
+                    )
+                )
+                sub.addAction(auto_item)
+                none_item = QAction("无动作", self, checkable=True)
+                none_item.setChecked(cur.get("type") == "none")
+                none_item.triggered.connect(
+                    lambda checked=False, s=status: self.set_status_action(
+                        s, {"type": "none"}
+                    )
+                )
+                sub.addAction(none_item)
+                sub.addSeparator()
+                for m in self.model_cfg.get("motions") or []:
+                    group = m["group"]
+                    item = QAction(
+                        m.get("label") or group, self, checkable=True
+                    )
+                    item.setChecked(
+                        cur.get("type") == "motion" and cur.get("key") == group
+                    )
+                    item.triggered.connect(
+                        lambda checked=False, s=status, g=group: self.set_status_action(
+                            s, {"type": "motion", "key": g}
+                        )
+                    )
+                    sub.addAction(item)
+                for key, info in expressions.items():
+                    if isinstance(info, dict):
+                        kind = info.get("kind", "face")
+                        expr_label = info.get("label", key)
+                    else:
+                        kind = "face"
+                        expr_label = key
+                    item = QAction(expr_label, self, checkable=True)
+                    item.setChecked(
+                        cur.get("type") == "expr" and cur.get("key") == key
+                    )
+                    item.triggered.connect(
+                        lambda checked=False, s=status, k=key: self.set_status_action(
+                            s, {"type": "expr", "key": k}
+                        )
+                    )
+                    sub.addAction(item)
 
             motion_menu = menu.addMenu("动作")
             motions = self.model_cfg.get("motions") or []
