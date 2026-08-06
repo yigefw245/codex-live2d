@@ -167,6 +167,48 @@ def _expr_classify(name):
     return None, "face", False
 
 
+def _model3_expression_entries(expressions):
+    """把扫描到的表情映射为 model3.json 的 Expressions 条目。
+
+    pixi-live2d-display 与 Soullink profile 生成器都从 FileReferences.Expressions
+    读取表情，所以导入模型时把 exp3 文件补注册进去，情绪引擎才能驱动原生表情。
+    表情名尽量取生成器启发式认识的英文名（star/happy/surprised/angry/tear/blush），
+    以便自动生成 expressionMap；星星眼额外注册一个 happy 别名。
+    水印/隐藏类固定效果不注册为表情。
+    """
+    name_map = {
+        "star": ["star", "happy"],
+        "heart": ["heart"],
+        "swirl": ["surprised"],
+        "black": ["angry"],
+        "tear": ["tear"],
+        "cry": ["sob"],
+        "teary": ["teary"],
+        "blush": ["blush"],
+        "fly": ["fly"],
+        "hand": ["hand"],
+        "notes": ["notes"],
+        "phone": ["phone"],
+        "lean": ["lean"],
+        "wry": ["wry"],
+        "tongue": ["tongue"],
+        "raiseL": ["raiseL"],
+        "raiseR": ["raiseR"],
+        "mic": ["mic"],
+        "dog": ["dog"],
+    }
+    entries = []
+    for key, info in expressions.items():
+        if key.startswith("hide") or key == "watermark":
+            continue
+        file = info.get("file") if isinstance(info, dict) else None
+        if not file:
+            continue
+        for name in name_map.get(key, [key]):
+            entries.append({"Name": name, "File": file})
+    return entries
+
+
 def build_model_config(model_dir, model3_rel, display_name, model_id):
     """扫描模型目录，自动生成 model.json 配置。"""
     expressions = {}
@@ -224,8 +266,6 @@ def build_model_config(model_dir, model3_rel, display_name, model_id):
                 m3["Motions"][os.path.splitext(os.path.basename(extra))[0]] = [
                     {"File": extra, "Loop": True}
                 ]
-            with open(m3_path, "w", encoding="utf-8") as f:
-                json.dump(m3, f, ensure_ascii=False, indent=1)
             motions.append(
                 {
                     "key": "idle",
@@ -236,6 +276,24 @@ def build_model_config(model_dir, model3_rel, display_name, model_id):
                 }
             )
             patched = True
+        expr_entries = _model3_expression_entries(expressions)
+        existing_fr_exprs = (
+            m3.get("FileReferences", {}).get("Expressions") or []
+        )
+        if not existing_fr_exprs:
+            entries = expr_entries or [
+                {"Name": e.get("Name", ""), "File": e.get("File", "")}
+                for e in (m3.get("Expressions") or [])
+            ]
+            entries = [e for e in entries if e.get("File")]
+            if entries:
+                m3.setdefault("FileReferences", {})["Expressions"] = entries
+                if not m3.get("Expressions"):
+                    m3["Expressions"] = entries
+            patched = True
+        if patched:
+            with open(m3_path, "w", encoding="utf-8") as f:
+                json.dump(m3, f, ensure_ascii=False, indent=1)
     except Exception:
         pass
 

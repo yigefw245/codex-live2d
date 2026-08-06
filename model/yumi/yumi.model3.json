@@ -6,7 +6,26 @@
 			"yumi.8192/texture_00.png"
 		],
 		"Physics": "yumi.physics3.json",
-		"DisplayInfo": "yumi.cdi3.json"
+		"DisplayInfo": "yumi.cdi3.json",
+		"Expressions": [
+			{ "Name": "heart", "File": "爱心眼.exp3.json" },
+			{ "Name": "star", "File": "星星眼.exp3.json" },
+			{ "Name": "tear", "File": "眼泪.exp3.json" },
+			{ "Name": "teary", "File": "泪汪汪.exp3.json" },
+			{ "Name": "wry", "File": "歪嘴.exp3.json" },
+			{ "Name": "catmouth", "File": "猫猫嘴.exp3.json" },
+			{ "Name": "eyepatch", "File": "眼罩.exp3.json" },
+			{ "Name": "black", "File": "黑脸.exp3.json" },
+			{ "Name": "swirl", "File": "蚊香眼.exp3.json" },
+			{ "Name": "tongue", "File": "舌头伸出.exp3.json" },
+			{ "Name": "mic", "File": "拿话筒.exp3.json" },
+			{ "Name": "bend", "File": "俯身按键.exp3.json" },
+			{ "Name": "raiseL", "File": "抬手左.exp3.json" },
+			{ "Name": "raiseR", "File": "抬手右.exp3.json" },
+			{ "Name": "dog", "File": "漂浮小狗.exp3.json" },
+			{ "Name": "hair1", "File": "短发1.exp3.json" },
+			{ "Name": "hair2", "File": "短发2.exp3.json" }
+		]
 	},
 	"Motions": {
 		"Idle": [

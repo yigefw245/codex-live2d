@@ -4,6 +4,7 @@
 //   node generate-profile.mjs [--force]          (all models)
 //   node generate-profile.mjs --root <modelsRoot> [--model <id>] [--force]
 import { readdirSync, existsSync } from "node:fs";
+import { readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { Live2DProfileAutoGenerator } from "@soullink-emotion/profile-generator";
 
@@ -42,6 +43,43 @@ const generator = new Live2DProfileAutoGenerator({
   useConfiguredOpenAI: false
 });
 
+// 生成器只按表情文件名启发式映射少数情绪（happy/excited/surprised/angry/sad/shy），
+// 这里把同一张脸的其他等价情绪别名也补进 expressionMap，让情绪反应覆盖更全。
+// 只有 catalog 里真实存在的表情名才会被引用。
+const EXPRESSION_ALIASES = [
+  { name: "happy", emotions: ["affectionate"] },
+  { name: "star", emotions: ["curious"] },
+  { name: "tear", emotions: ["teary", "anxiety", "tired", "concerned"] },
+  { name: "angry", emotions: ["anger"] },
+  { name: "surprised", emotions: ["confused"] }
+];
+
+async function extendExpressionMap(profilePath) {
+  let profile;
+  try {
+    profile = JSON.parse(await readFile(profilePath, "utf8"));
+  } catch {
+    return;
+  }
+  const catalogNames = new Set(
+    (profile.nativeAnimations?.expressions ?? []).map((entry) => entry.name)
+  );
+  const expressionMap = profile.expressionMap ?? {};
+  let changed = false;
+  for (const alias of EXPRESSION_ALIASES) {
+    if (!catalogNames.has(alias.name)) continue;
+    for (const emotion of alias.emotions) {
+      if (expressionMap[emotion] === undefined) {
+        expressionMap[emotion] = alias.name;
+        changed = true;
+      }
+    }
+  }
+  if (!changed) return;
+  profile.expressionMap = expressionMap;
+  await writeFile(profilePath, JSON.stringify(profile, null, 2) + "\n", "utf8");
+}
+
 const results = [];
 for (const modelDir of modelDirs()) {
   const profilePath = resolve(modelsRoot, modelDir, "soullink.profile.json");
@@ -67,6 +105,9 @@ for (const modelDir of modelDirs()) {
       profileUrl: result.profileUrl,
       notes: result.notes.slice(0, 5)
     });
+    if (result.generated) {
+      await extendExpressionMap(profilePath);
+    }
   } catch (error) {
     results.push({
       model: modelDir,

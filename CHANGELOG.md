@@ -1,5 +1,15 @@
 # 更新日志
 
+## v2.0.2（2026-08-06）
+
+### ✨ 新功能
+
+- **Soullink 情绪引擎现在能驱动原生表情了**：此前 pixi-live2d-display 只从 `model3.json` 的 `FileReferences.Expressions` 读取表情，而标准模型文件把它们放在顶层，导致 SDK 的原生表情从未加载成功
+  - 悠小喵：注册了 星星眼 / 晕晕眼 / 黑脸 / 流泪 / 哭哭 / 脸红 / 飞头 等 12 个表情，情绪识别到 happy / sad / angry / surprised / shy / confused 等会直接切换对应脸
+  - yumi：同样补上 `FileReferences.Expressions`，爱心眼 / 星星眼 / 眼泪 / 黑脸 / 蚊香眼 等原生表情生效
+- **导入模型自动注册 Expressions**：导入新模型时，如果模型目录里有 `.exp3.json` 表情文件但 `model3.json` 未声明，会自动补注册（含星星眼的 happy 别名），情绪引擎开箱即用
+- **profile 生成器自动补全情绪别名**：teary / anxiety / tired / concerned 归入 tear，anger 归入 angry，affectionate 归入 happy，curious 归入 star，confused 归入 surprised
+
 ## v2.0.1（2026-08-06）
 
 ### 🔧 修复
