@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QVBoxLayout,
     QWidget,
+    QWidgetAction,
 )
 from PySide6.QtWebChannel import QWebChannel
 from PySide6.QtWebEngineCore import QWebEngineSettings
@@ -432,6 +433,60 @@ SOULLINK_DEFAULTS = {
 }
 
 SOULLINK_MOTION_STYLES = ["natural", "lively", "calm", "shy"]
+
+MENU_QSS = """
+QMenu {
+    background-color: rgba(26, 28, 36, 242);
+    border: 1px solid rgba(255, 255, 255, 28);
+    border-radius: 14px;
+    padding: 6px;
+    font-family: "Microsoft YaHei";
+    font-size: 13px;
+}
+QMenu::item {
+    background: transparent;
+    color: #e7e9f2;
+    padding: 7px 32px 7px 14px;
+    border-radius: 8px;
+    margin: 1px 5px;
+}
+QMenu::item:selected {
+    background: qlineargradient(
+        x1: 0, y1: 0, x2: 1, y2: 0,
+        stop: 0 #6d5cf0, stop: 1 #a855f7
+    );
+    color: #ffffff;
+}
+QMenu::item:disabled {
+    color: rgba(255, 255, 255, 96);
+}
+QMenu::item:checked {
+    color: #c4b5fd;
+}
+QMenu::separator {
+    height: 1px;
+    background: rgba(255, 255, 255, 24);
+    margin: 6px 14px;
+}
+QMenu::right-arrow {
+    width: 14px;
+    height: 14px;
+    margin-right: 10px;
+}
+QMenu::indicator {
+    width: 14px;
+    height: 14px;
+    margin-left: 4px;
+}
+"""
+
+
+def _new_menu(title="", parent=None):
+    """创建应用了暗色玻璃样式的 QMenu（含子菜单，统一圆角透明背景）。"""
+    menu = QMenu(title, parent)
+    menu.setStyleSheet(MENU_QSS)
+    menu.setAttribute(Qt.WA_TranslucentBackground)
+    return menu
 
 
 def _read_env_file(path):
@@ -1739,8 +1794,22 @@ class PetWindow(QWidget):
 
     def show_menu(self):
         try:
-            menu = QMenu(self)
-            model_menu = menu.addMenu("模型")
+            menu = _new_menu(parent=self)
+            header = QLabel(f"✦  {self.model_cfg.get('name', self.model_id)}")
+            header.setAlignment(Qt.AlignCenter)
+            header.setStyleSheet(
+                "color: #a9b2c8;"
+                "font-size: 11px;"
+                "font-weight: bold;"
+                "padding: 5px 10px 3px 10px;"
+                "background: transparent;"
+            )
+            header_action = QWidgetAction(menu)
+            header_action.setDefaultWidget(header)
+            menu.addAction(header_action)
+            menu.addSeparator()
+            model_menu = _new_menu("模型", menu)
+            menu.addMenu(model_menu)
             for m in self.models:
                 action = QAction(m["name"], self, checkable=True)
                 action.setChecked(m["id"] == self.model_id)
@@ -1748,7 +1817,8 @@ class PetWindow(QWidget):
                     lambda checked=False, mid=m["id"]: self.switch_model(mid)
                 )
                 model_menu.addAction(action)
-            delete_menu = model_menu.addMenu("删除模型")
+            delete_menu = _new_menu("删除模型", model_menu)
+            model_menu.addMenu(delete_menu)
             deletable = [m for m in self.models if m["id"] != "yumi"]
             if deletable:
                 for m in deletable:
@@ -1779,7 +1849,8 @@ class PetWindow(QWidget):
                 )
             )
 
-            status_menu = menu.addMenu("状态动作")
+            status_menu = _new_menu("状态动作", menu)
+            menu.addMenu(status_menu)
             per_model_actions = model_actions(self.settings, self.model_id)
             status_list = [
                 ("待机", "idle"),
@@ -1791,7 +1862,8 @@ class PetWindow(QWidget):
             ]
             expressions = self.model_cfg.get("expressions") or {}
             for label, status in status_list:
-                sub = status_menu.addMenu(label)
+                sub = _new_menu(label, status_menu)
+                status_menu.addMenu(sub)
                 cur = per_model_actions.get(status) or {}
                 auto_item = QAction(
                     f"自动（{self._default_action_label(status)}）",
@@ -1846,7 +1918,8 @@ class PetWindow(QWidget):
                     )
                     sub.addAction(item)
 
-            motion_menu = menu.addMenu("动作")
+            motion_menu = _new_menu("动作", menu)
+            menu.addMenu(motion_menu)
             motions = self.model_cfg.get("motions") or []
             if motions:
                 for m in motions:
@@ -1860,7 +1933,8 @@ class PetWindow(QWidget):
                 QAction("停止动作", self, triggered=self.stop_motion)
             )
 
-            exp_menu = menu.addMenu("表情")
+            exp_menu = _new_menu("表情", menu)
+            menu.addMenu(exp_menu)
             expressions = self.model_cfg.get("expressions") or {}
             for key, info in expressions.items():
                 if isinstance(info, dict):
@@ -1895,7 +1969,8 @@ class PetWindow(QWidget):
             menu.addAction(
                 QAction("聊天设置…", self, triggered=self.open_chat_settings)
             )
-            screen_menu = menu.addMenu("读屏幕")
+            screen_menu = _new_menu("读屏幕", menu)
+            menu.addMenu(screen_menu)
             screen_toggle = QAction("开启读屏幕", self, checkable=True)
             screen_toggle.setChecked(bool(self.screen_cfg.get("enabled")))
             screen_toggle.triggered.connect(self.set_screen_read_enabled)
@@ -1914,7 +1989,8 @@ class PetWindow(QWidget):
                     triggered=self.read_screen_now,
                 )
             )
-            soullink_menu = menu.addMenu("Soullink 情绪引擎")
+            soullink_menu = _new_menu("Soullink 情绪引擎", menu)
+            menu.addMenu(soullink_menu)
             soullink_toggle = QAction(
                 "开启（Embedding 识别 + 动作 + TTS）",
                 self,
@@ -2031,6 +2107,8 @@ def main():
     atexit.register(remove_pid_file)
     remove_disabled_flag()
     app = QApplication(sys.argv)
+    # Fusion + QSS：让右键菜单支持圆角与渐变高亮（原生 Windows 样式会忽略这些）
+    app.setStyle("Fusion")
     app.setQuitOnLastWindowClosed(True)
     PetWindow()
     return app.exec()
