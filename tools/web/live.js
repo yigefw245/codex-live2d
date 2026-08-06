@@ -78,6 +78,13 @@ function exprKind(key) {
   return "face";
 }
 
+// 单模型底部裁切比例（0-1），用于隐藏角色脚下额外画的内容（如水印文字）。
+function cropBottom() {
+  return (
+    (modelConfig && modelConfig.crop && modelConfig.crop.bottom) || 0
+  );
+}
+
 // 状态动作解析：手动指定优先；未指定 / 指定项不存在时回退默认配置。
 function resolveStatusAction(name) {
   const ov = actionOverrides[name] || {};
@@ -517,7 +524,10 @@ function reposition() {
   model.update(0.001);
   const b = model.getBounds();
   model.x += cw / 2 - (b.x + b.width / 2);
-  model.y += (ch - STATUS_H - PAD - chatPanelH) - (b.y + b.height);
+  // 以“裁切后的角色底部”对齐窗口底部，把裁掉的部分（文字）留在窗口外。
+  model.y +=
+    (ch - STATUS_H - PAD - chatPanelH) -
+    (b.y + b.height * (1 - cropBottom()));
   computeHeadRef();
 }
 
@@ -527,13 +537,17 @@ function fitModel() {
   if (!cw || !ch || !model) return;
   app.renderer.resize(cw, ch);
   const regionH = ch - STATUS_H - PAD * 2;
+  const s0 = baseScale || 1;
+  model.scale.set(s0, s0);
   model.update(0.001);
   const b = model.getBounds();
   const fit = Math.min(
     (cw - PAD * 2) / Math.max(1, b.width),
-    regionH / Math.max(1, b.height)
+    regionH / Math.max(1, b.height * (1 - cropBottom()))
   );
-  model.scale.set(model.scale.x * fit, model.scale.y * fit);
+  const s1 = s0 * fit;
+  baseScale = s1;
+  model.scale.set(s1 * (currentScale || 1), s1 * (currentScale || 1));
   reposition();
 }
 
@@ -570,13 +584,18 @@ function measureBounds() {
     ? { w: union.x2 - union.x, h: union.y2 - union.y }
     : { w: 440, h: 700 };
   reportBounds();
+  // 窗口按裁切后的尺寸重排后，重新适配一次，避免缩放错位。
+  setTimeout(() => fitModel(), 250);
   applyCurrentMotion();
   reposition();
 }
 
 function reportBounds() {
   if (window.__bridge && baseBounds) {
-    window.__bridge.set_bounds(baseBounds.w, baseBounds.h);
+    window.__bridge.set_bounds(
+      baseBounds.w,
+      baseBounds.h * (1 - cropBottom())
+    );
   }
 }
 
