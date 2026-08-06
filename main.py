@@ -116,6 +116,18 @@ def unique_model_id(base):
     return candidate
 
 
+def _fix_zip_name(name):
+    """部分压缩包把中文文件名存成 GBK，Python 会按 cp437 解成乱码，
+    这里尝试还原成正确的中文名；纯 ASCII 或已是正确 Unicode 的名字原样返回。"""
+    try:
+        fixed = name.encode("cp437").decode("gbk")
+        if any("\u4e00" <= ch <= "\u9fff" for ch in fixed):
+            return fixed
+    except Exception:
+        pass
+    return name
+
+
 def _expr_classify(name):
     """按文件名关键词把表情映射为 key / kind / 是否固定效果。"""
     name = str(name)
@@ -822,22 +834,23 @@ class PetWindow(QWidget):
             with zipfile.ZipFile(path) as zf:
                 names = zf.namelist()
                 dirs = [
-                    n.split("/")[0]
+                    _fix_zip_name(n).split("/")[0]
                     for n in names
                     if "/" in n and not n.endswith("/")
                 ]
                 strip = dirs[0] + "/" if len(set(dirs)) == 1 else ""
                 os.makedirs(dest, exist_ok=True)
-                for n in names:
-                    if n.endswith("/"):
+                for raw in names:
+                    if raw.endswith("/"):
                         continue
+                    n = _fix_zip_name(raw)
                     rel = n[len(strip):] if strip else n
                     target = os.path.normpath(os.path.join(dest, rel))
                     if not target.startswith(dest):
                         continue
                     os.makedirs(os.path.dirname(target), exist_ok=True)
                     with open(target, "wb") as f:
-                        f.write(zf.read(n))
+                        f.write(zf.read(raw))
         except Exception:
             shutil.rmtree(dest, ignore_errors=True)
             self._notify("导入失败：压缩包无法解析")
