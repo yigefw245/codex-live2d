@@ -159,4 +159,5 @@ python -m venv .venv
 ## ⚠️ 声明
 
 - 本项目仅用于学习交流；Live2D 模型文件版权归原作者所有
+- 默认模型 yumi 来源：B 站视频 [BV1LM41137vK](https://www.bilibili.com/video/BV1LM41137vK)
 - 依赖的 PixiJS、pixi-live2d-display 均为开源库，Live2D Cubism Core 遵循官方 SDK 许可
