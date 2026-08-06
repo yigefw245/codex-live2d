@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QLineEdit,
     QMenu,
+    QMessageBox,
     QPlainTextEdit,
     QVBoxLayout,
     QWidget,
@@ -723,6 +724,49 @@ class PetWindow(QWidget):
         # 整页重载，让 QtWebEngine 以全新上下文加载新模型，避免原地换模型卡死。
         self.view.reload()
 
+    def delete_model(self, model_id):
+        if model_id == "yumi":
+            self._notify("默认模型 yumi 不可删除")
+            return
+        target = os.path.join(MODEL_DIR, model_id)
+        if not os.path.isdir(target):
+            self._notify("模型不存在")
+            return
+        ret = QMessageBox.question(
+            self,
+            "删除模型",
+            f"确定要删除模型「{model_id}」吗？\n"
+            "模型文件将被永久删除，此操作不可恢复。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            shutil.rmtree(target)
+        except Exception:
+            self._notify("删除失败：模型文件可能被占用")
+            return
+        actions = self.settings.setdefault("actions", {})
+        actions.pop(model_id, None)
+        save_settings(self.settings)
+        self.models = list_models()
+        if self.model_id == model_id:
+            self.model_id = "yumi"
+            self.model_cfg = load_model_config("yumi") or {}
+            self.settings["model"] = "yumi"
+            save_settings(self.settings)
+            self.current_expression = None
+            self.view.reload()
+            QTimer.singleShot(
+                1600,
+                lambda mid=model_id: self._notify(
+                    f"模型「{mid}」已删除，已切换到 yumi"
+                ),
+            )
+        else:
+            self._notify(f"模型「{model_id}」已删除")
+
     def set_status_action(self, status, choice):
         actions = self.settings.setdefault("actions", {})
         per_model = actions.setdefault(self.model_id, {})
@@ -1017,6 +1061,21 @@ class PetWindow(QWidget):
                     lambda checked=False, mid=m["id"]: self.switch_model(mid)
                 )
                 model_menu.addAction(action)
+            delete_menu = model_menu.addMenu("删除模型")
+            deletable = [m for m in self.models if m["id"] != "yumi"]
+            if deletable:
+                for m in deletable:
+                    action = QAction(m["name"], self)
+                    action.triggered.connect(
+                        lambda checked=False, mid=m["id"]: self.delete_model(
+                            mid
+                        )
+                    )
+                    delete_menu.addAction(action)
+            else:
+                delete_menu.addAction(
+                    QAction("（没有可删除的模型）", self, enabled=False)
+                )
             model_menu.addSeparator()
             model_menu.addAction(
                 QAction(
