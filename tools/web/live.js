@@ -487,14 +487,6 @@ function reportHead() {
 
 function reportDiag() {
   if (window.__bridge) {
-    let wm = null;
-    try {
-      if (model && model.internalModel && model.internalModel.coreModel) {
-        wm = +model.internalModel.coreModel
-          .getParameterValueById("Param85")
-          .toFixed(3);
-      }
-    } catch (e) {}
     window.__bridge.set_diag(
       JSON.stringify({
         ready: window.__ready,
@@ -512,7 +504,6 @@ function reportDiag() {
           fade: +exprFade.toFixed(3),
         },
         motion: { active: motionActive, preset: presetMotion, manual: manualMotion },
-        wm: wm,
       })
     );
   }
