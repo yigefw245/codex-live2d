@@ -677,12 +677,13 @@ function onFrame(ts) {
   lastTs = ts;
   const t = ts / 1000;
 
+  // Eye / head follow the mouse (target comes from Python, screen-space).
+  const nx = clamp(eyeTargetX, -1, 1);
+  const ny = clamp(eyeTargetY, -1, 1);
+  eyeX += (nx - eyeX) * Math.min(1, dt * 6);
+  eyeY += (ny - eyeY) * Math.min(1, dt * 6);
+
   if (!soullinkEnabled()) {
-    // Eye / head follow the mouse (target comes from Python, screen-space).
-    const nx = clamp(eyeTargetX, -1, 1);
-    const ny = clamp(eyeTargetY, -1, 1);
-    eyeX += (nx - eyeX) * Math.min(1, dt * 6);
-    eyeY += (ny - eyeY) * Math.min(1, dt * 6);
     setParam("ParamEyeBallX", eyeX);
     setParam("ParamEyeBallY", -eyeY * 0.9);
     setParam("ParamAngleX", eyeX * 22);
@@ -708,6 +709,13 @@ function onFrame(ts) {
     }
   } else {
     model.update(dt);
+    // Soullink 模式：身体/表情由 SDK 情绪引擎驱动，这里只补回鼠标追踪
+    // （眼神全量跟随，头部/身体减半幅度，避免完全盖掉情绪姿态）。
+    setParam("ParamEyeBallX", eyeX);
+    setParam("ParamEyeBallY", -eyeY * 0.9);
+    setParam("ParamAngleX", eyeX * 11);
+    setParam("ParamAngleY", -eyeY * 9);
+    setParam("ParamBodyAngleX", eyeX * 2.5);
   }
 
   app.render();

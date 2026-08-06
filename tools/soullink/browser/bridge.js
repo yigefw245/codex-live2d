@@ -158,6 +158,10 @@ async function start(config) {
   });
 
   session.setAutoVoiceEnabled(true);
+  // 说话（SPEAKING）状态下 SDK 会主动压低情绪层权重并关闭空闲手势，
+  // 导致回复时身体几乎不动。提高参数/身体增益，让情绪姿态与表情清晰可见。
+  session.setParameterGain(2.2);
+  session.setBodyMotionGain(2.8);
   session.start();
   started = true;
   if (modelRef) attachParamsHook(modelRef);

@@ -6369,6 +6369,8 @@ async function start(config) {
     }
   });
   session.setAutoVoiceEnabled(true);
+  session.setParameterGain(2.2);
+  session.setBodyMotionGain(2.8);
   session.start();
   started = true;
   if (modelRef) attachParamsHook(modelRef);
