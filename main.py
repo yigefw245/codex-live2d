@@ -19,6 +19,7 @@ from PySide6.QtCore import QBuffer, QIODevice, QObject, QTimer, QUrl, Qt, Signal
 from PySide6.QtGui import QAction, QColor, QCursor, QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -448,6 +449,9 @@ VOICE_INPUT_DEFAULTS = {
     "model": "small",
     "language": "zh",
     "hf_endpoint": "",
+    "hotkey_enabled": True,
+    "hotkey_key": "F8",
+    "hotkey_modifiers": "",
 }
 
 STT_CACHE_ROOT = os.path.join(BASE_DIR, ".cache", "stt")
@@ -469,6 +473,31 @@ STT_MODELSCOPE_REPOS = {
 }
 
 STT_REQUIRED_FILES = ("model.bin", "config.json", "tokenizer.json", "vocabulary.txt")
+
+STT_HOTKEY_KEYS = {
+    "F1": 0x70,
+    "F2": 0x71,
+    "F3": 0x72,
+    "F4": 0x73,
+    "F5": 0x74,
+    "F6": 0x75,
+    "F7": 0x76,
+    "F8": 0x77,
+    "F9": 0x78,
+    "F10": 0x79,
+    "F11": 0x7A,
+    "F12": 0x7B,
+    "CapsLock": 0x14,
+    "ScrollLock": 0x91,
+    "Pause": 0x13,
+}
+
+STT_HOTKEY_MODIFIER_VKS = {
+    "ctrl": 0x11,
+    "shift": 0x10,
+    "alt": 0x12,
+    "win": 0x5B,
+}
 
 # 未配置聊天接口时主动发言的兜底台词
 PROACTIVE_FALLBACK_LINES = [
@@ -721,7 +750,9 @@ def load_voice_input_config():
             saved = (json.load(f).get("voice_input") or {})
         if isinstance(saved.get("enabled"), bool):
             cfg["enabled"] = saved["enabled"]
-        for key in ("model", "language", "hf_endpoint"):
+        if isinstance(saved.get("hotkey_enabled"), bool):
+            cfg["hotkey_enabled"] = saved["hotkey_enabled"]
+        for key in ("model", "language", "hf_endpoint", "hotkey_key", "hotkey_modifiers"):
             if isinstance(saved.get(key), str) and saved[key].strip():
                 cfg[key] = saved[key].strip()
     except Exception:
@@ -1097,6 +1128,17 @@ class LocalVoiceRecognizer:
             self._error = f"语音识别失败：{exc}"
             return ""
 
+    def abort(self):
+        """放弃当前录音（例如按住说话时提前松键取消）。"""
+        with self._lock:
+            recorder = self._recorder
+            self._recording = False
+        if recorder is not None:
+            try:
+                recorder.abort()
+            except Exception:
+                pass
+
     def shutdown(self):
         with self._lock:
             recorder = self._recorder
@@ -1383,10 +1425,56 @@ class VoiceInputSettingsDialog(QDialog):
         self.endpoint_edit = QLineEdit(str(cfg.get("hf_endpoint", "")).strip())
         self.endpoint_edit.setPlaceholderText("例如 https://hf-mirror.com（默认留空）")
         form.addRow("模型下载镜像", self.endpoint_edit)
+
+        self.hotkey_check = QCheckBox("启用「按住说话」快捷键")
+        self.hotkey_check.setChecked(bool(cfg.get("hotkey_enabled", True)))
+        form.addRow("快捷键", self.hotkey_check)
+
+        self.hotkey_combo = QComboBox()
+        current_key = str(cfg.get("hotkey_key") or "F8")
+        key_options = [
+            ("F1", "F1"),
+            ("F2", "F2"),
+            ("F3", "F3"),
+            ("F4", "F4"),
+            ("F5", "F5"),
+            ("F6", "F6"),
+            ("F7", "F7"),
+            ("F8（推荐）", "F8"),
+            ("F9", "F9"),
+            ("F10", "F10"),
+            ("F11", "F11"),
+            ("F12", "F12"),
+            ("Caps Lock", "CapsLock"),
+            ("Scroll Lock", "ScrollLock"),
+            ("Pause", "Pause"),
+        ]
+        for label, value in key_options:
+            self.hotkey_combo.addItem(label, value)
+        idx = self.hotkey_combo.findData(current_key)
+        self.hotkey_combo.setCurrentIndex(idx if idx >= 0 else 7)
+
+        self.hotkey_mods_combo = QComboBox()
+        current_mods = str(cfg.get("hotkey_modifiers") or "").strip()
+        mod_options = [
+            ("无", ""),
+            ("Ctrl +", "ctrl"),
+            ("Shift +", "shift"),
+            ("Alt +", "alt"),
+            ("Ctrl + Shift +", "ctrl+shift"),
+            ("Ctrl + Alt +", "ctrl+alt"),
+        ]
+        for label, value in mod_options:
+            self.hotkey_mods_combo.addItem(label, value)
+        idx = self.hotkey_mods_combo.findData(current_mods)
+        self.hotkey_mods_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        form.addRow("按键", self.hotkey_combo)
+        form.addRow("组合键", self.hotkey_mods_combo)
         layout.addLayout(form)
 
         hint = QLabel(
             "在聊天模式输入框左侧点 🎤 开始录音，再点一次结束并识别成文字填入输入框。\n"
+            "开启快捷键后，按住设定按键说话、松开自动识别并发送，不需要再点发送。\n"
             "识别在本机完成（RealtimeSTT + faster-whisper），不经过任何云端 API；\n"
             "首次使用会自动下载所选模型（small 约 460MB），之后离线可用；\n"
             "下载会自动尝试 ModelScope（国内）→ 配置镜像 → hf-mirror.com → "
@@ -1407,6 +1495,9 @@ class VoiceInputSettingsDialog(QDialog):
             "model": str(self.model_combo.currentData() or "small"),
             "language": str(self.language_combo.currentData() or ""),
             "hf_endpoint": self.endpoint_edit.text().strip(),
+            "hotkey_enabled": self.hotkey_check.isChecked(),
+            "hotkey_key": str(self.hotkey_combo.currentData() or "F8"),
+            "hotkey_modifiers": str(self.hotkey_mods_combo.currentData() or ""),
         }
 
 
@@ -1458,6 +1549,9 @@ class PetWindow(QWidget):
     voice_text = Signal(str)
     voice_ui = Signal(str)
     voice_status = Signal(str)
+    voice_send = Signal(str)
+    voice_ptt_down = Signal()
+    voice_ptt_up = Signal()
 
     def __init__(self):
         super().__init__()
@@ -1520,6 +1614,10 @@ class PetWindow(QWidget):
         self.voice_recording = False
         self.voice_busy = False
         self.voice_token = 0
+        self.voice_pending_abort = False
+        self._ptt_stop_event = threading.Event()
+        self._ptt_thread = None
+        self._ptt_down = False
         self.voice_recognizer.set_progress_callback(
             lambda text: self.voice_status.emit(text)
         )
@@ -1530,6 +1628,13 @@ class PetWindow(QWidget):
         )
         self.voice_ui.connect(self._run_js)
         self.voice_status.connect(self._notify)
+        self.voice_send.connect(self._voice_send_text)
+        self.voice_ptt_down.connect(self._on_ptt_down)
+        self.voice_ptt_up.connect(self._on_ptt_up)
+        if self.voice_cfg.get("enabled") and self.voice_cfg.get(
+            "hotkey_enabled"
+        ):
+            self._start_ptt()
         self.dragging = False
         self.drag_start_pos = None
         self.drag_start_window = None
@@ -1664,7 +1769,9 @@ class PetWindow(QWidget):
         self._run_js(f"window.setPetState({json.dumps(self.state)})")
         self._run_js(f"window.setScale({self.scale})")
         self._run_js(
-            f"window.setVoiceInputEnabled({str(bool(self.voice_cfg.get('enabled'))).lower()})"
+            "window.setVoiceInputEnabled("
+            f"{str(bool(self.voice_cfg.get('enabled'))).lower()},"
+            f"{json.dumps(self._ptt_label(), ensure_ascii=False)})"
         )
         self._push_soullink_config()
 
@@ -1897,8 +2004,10 @@ class PetWindow(QWidget):
         self.voice_cfg["enabled"] = False
         save_voice_input_config(self.voice_cfg)
         self.voice_recording = False
+        self._stop_ptt()
         self.voice_token += 1
         self.voice_busy = False
+        self.voice_pending_abort = False
         self.voice_recognizer.cancel()
         self.voice_recognizer.shutdown()
         self._run_js("window.setVoiceInputEnabled(false)")
@@ -2089,16 +2198,37 @@ class PetWindow(QWidget):
         enabled = bool(enabled)
         self.voice_cfg["enabled"] = enabled
         save_voice_input_config(self.voice_cfg)
+        if enabled:
+            if self.voice_cfg.get("hotkey_enabled"):
+                self._start_ptt()
+            self._run_js(
+                "window.setVoiceInputEnabled(true,"
+                f"{json.dumps(self._ptt_label(), ensure_ascii=False)})"
+            )
+            self._notify(
+                "语音输入已开启：按住 "
+                f"{self._ptt_label()} 说话，松开自动发送"
+            )
+            return
         if not enabled and self.voice_recording:
             self.voice_recording = False
             self._run_js("window.setVoiceRecording(false)")
-        if not enabled:
-            self.voice_token += 1
-            self.voice_busy = False
-            self.voice_recognizer.cancel()
-            self.voice_recognizer.shutdown()
+        self._stop_ptt()
+        self.voice_token += 1
+        self.voice_busy = False
+        self.voice_pending_abort = False
+        self.voice_recognizer.cancel()
+        self.voice_recognizer.shutdown()
         self._run_js(f"window.setVoiceInputEnabled({str(enabled).lower()})")
-        self._notify("语音输入已开启（聊天框左侧 🎤）" if enabled else "语音输入已关闭")
+        self._notify("语音输入已关闭")
+
+    def _ptt_label(self):
+        mods = str(self.voice_cfg.get("hotkey_modifiers") or "").strip()
+        key = str(self.voice_cfg.get("hotkey_key") or "F8")
+        parts = [p.strip() for p in mods.replace("+", " ").split() if p.strip()]
+        if not parts:
+            return key
+        return " + ".join(p.upper() for p in parts) + " + " + key
 
     def open_voice_input_settings(self):
         cfg = load_voice_input_config()
@@ -2109,8 +2239,10 @@ class PetWindow(QWidget):
         if self.voice_recording:
             self.voice_recording = False
             self._run_js("window.setVoiceRecording(false)")
+        self._stop_ptt()
         self.voice_token += 1
         self.voice_busy = False
+        self.voice_pending_abort = False
         self.voice_recognizer.cancel()
         self.voice_recognizer.shutdown()
         self.voice_cfg.update(data)
@@ -2120,6 +2252,10 @@ class PetWindow(QWidget):
         self.voice_recognizer.set_progress_callback(
             lambda text: self.voice_status.emit(text)
         )
+        if self.voice_cfg.get("enabled") and self.voice_cfg.get(
+            "hotkey_enabled"
+        ):
+            self._start_ptt()
         self._notify("语音输入设置已更新")
 
     def toggle_voice_recording(self):
@@ -2129,28 +2265,14 @@ class PetWindow(QWidget):
         if self.voice_busy:
             return
         if self.voice_recording:
-            self.voice_recording = False
-            self.voice_busy = True
-            self._run_js("window.setVoiceRecording(false)")
-            self._notify("录音结束，正在识别…")
-
-            def _finish():
-                token = self.voice_token
-                try:
-                    text = self.voice_recognizer.stop_and_transcribe()
-                finally:
-                    self.voice_busy = False
-                if token != self.voice_token:
-                    return
-                if not text:
-                    self.voice_status.emit(
-                        self.voice_recognizer.error() or "没听清，再说一次？"
-                    )
-                    return
-                self.voice_text.emit(text)
-
-            threading.Thread(target=_finish, daemon=True).start()
+            self._voice_stop_and_send()
             return
+        self._voice_start()
+
+    def _voice_start(self):
+        if self.voice_busy or self.voice_recording:
+            return
+        self.voice_pending_abort = False
 
         def _begin():
             token = self.voice_token
@@ -2168,14 +2290,121 @@ class PetWindow(QWidget):
             if token != self.voice_token:
                 self.voice_busy = False
                 return
+            if self.voice_pending_abort:
+                # 按键已松开（或录音被取消），不进入录音状态
+                self.voice_pending_abort = False
+                self.voice_busy = False
+                self.voice_recognizer.abort()
+                return
             self.voice_recording = True
             self.voice_busy = False
             self.voice_ui.emit("window.setVoiceRecording(true)")
-            self.voice_status.emit("🎤 正在录音，再说一次结束")
+            if self._ptt_down:
+                self.voice_status.emit("🎤 正在录音，松开按键发送")
+            else:
+                self.voice_status.emit("🎤 正在录音，再点一次结束并发送")
 
         self.voice_busy = True
         self._notify("正在启动本地语音识别…")
         threading.Thread(target=_begin, daemon=True).start()
+
+    def _voice_stop_and_send(self):
+        if self.voice_busy:
+            return
+        self.voice_recording = False
+        self.voice_busy = True
+        self._run_js("window.setVoiceRecording(false)")
+        self._notify("录音结束，正在识别…")
+
+        def _finish():
+            token = self.voice_token
+            try:
+                text = self.voice_recognizer.stop_and_transcribe()
+            finally:
+                self.voice_busy = False
+            if token != self.voice_token:
+                return
+            if not text:
+                self.voice_status.emit(
+                    self.voice_recognizer.error() or "没听清，再说一次？"
+                )
+                return
+            # 填进输入框并直接发送，不需要再点发送按钮
+            self.voice_text.emit(text)
+            self.voice_send.emit(text)
+
+        threading.Thread(target=_finish, daemon=True).start()
+
+    def _voice_send_text(self, text):
+        self._run_js("window.showChatReply('…', 60000)")
+        self.handle_chat(text)
+
+    # ---------- 按住说话快捷键 ----------
+
+    def _ptt_key_down(self):
+        cfg = self.voice_cfg
+        vk = STT_HOTKEY_KEYS.get(str(cfg.get("hotkey_key", "F8")))
+        if not vk:
+            return False
+        get_key = ctypes.windll.user32.GetAsyncKeyState
+        if not (get_key(vk) & 0x8000):
+            return False
+        mods = str(cfg.get("hotkey_modifiers") or "").lower()
+        for part in mods.replace("+", " ").split():
+            mod_vk = STT_HOTKEY_MODIFIER_VKS.get(part.strip())
+            if mod_vk and not (get_key(mod_vk) & 0x8000):
+                return False
+        return True
+
+    def _start_ptt(self):
+        self._stop_ptt()
+        self._ptt_stop_event = threading.Event()
+        self._ptt_down = False
+        self._ptt_thread = threading.Thread(
+            target=self._ptt_loop, daemon=True
+        )
+        self._ptt_thread.start()
+
+    def _stop_ptt(self):
+        self._ptt_stop_event.set()
+        self._ptt_down = False
+        thread = self._ptt_thread
+        self._ptt_thread = None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1.0)
+
+    def _ptt_loop(self):
+        while not self._ptt_stop_event.is_set():
+            pressed = self._ptt_key_down()
+            if pressed and not self._ptt_down:
+                self._ptt_down = True
+                self.voice_ptt_down.emit()
+            elif not pressed and self._ptt_down:
+                self._ptt_down = False
+                self.voice_ptt_up.emit()
+            self._ptt_stop_event.wait(0.06)
+
+    def _on_ptt_down(self):
+        if not self.voice_cfg.get("enabled"):
+            return
+        if not self.chat_mode:
+            self._notify("语音输入要在聊天模式下使用，先打开聊天模式吧")
+            return
+        if self.voice_busy:
+            return
+        if self.voice_recording:
+            return
+        self._voice_start()
+
+    def _on_ptt_up(self):
+        if not self.voice_cfg.get("enabled"):
+            return
+        if self.voice_busy:
+            # 录音还没真正开始（例如首次加载模型），标记为取消，避免松手后空录
+            self.voice_pending_abort = True
+            return
+        if self.voice_recording:
+            self._voice_stop_and_send()
 
     # ---------- 读屏幕 ----------
 
@@ -2831,6 +3060,7 @@ class PetWindow(QWidget):
             pass
         try:
             self.voice_token += 1
+            self._stop_ptt()
             self.voice_recognizer.cancel()
             self.voice_recognizer.shutdown()
         except Exception:

@@ -848,9 +848,12 @@ window.setScale = setScale;
 
 const chatMicEl = document.getElementById("chat-mic");
 
-window.setVoiceInputEnabled = (on) => {
+window.setVoiceInputEnabled = (on, keyLabel) => {
   chatMicEl.classList.toggle("show", !!on);
   if (!on) chatMicEl.classList.remove("recording");
+  chatMicEl.title = keyLabel
+    ? `按住 ${keyLabel} 说话，松开发送（或点击录音）`
+    : "语音输入";
 };
 
 window.setVoiceRecording = (on) => {

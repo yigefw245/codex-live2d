@@ -15,7 +15,10 @@
     "enabled": false,
     "model": "small",
     "language": "zh",
-    "hf_endpoint": ""
+    "hf_endpoint": "",
+    "hotkey_enabled": true,
+    "hotkey_key": "F8",
+    "hotkey_modifiers": ""
   },
   "screen_read": {
     "enabled": false,
