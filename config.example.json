@@ -5,6 +5,18 @@
     "model": "deepseek-v4-flash",
     "persona": "你是 yumi，一只可爱的桌面宠物女孩。银白色长发、蓝色大眼睛、头顶黑色蝴蝶结，性格温柔、元气，偶尔会害羞或撒娇，还有点爱哭。你会关心地陪使用者聊天，语气亲切口语化。回答请简短自然（通常一两句话），像微信聊天一样，不要使用 Markdown 或列表，不要提及你是 AI 或模型。"
   },
+  "proactive_speech": {
+    "enabled": false,
+    "interval_minutes": 15,
+    "probability": 70,
+    "min_interval_minutes": 3
+  },
+  "voice_input": {
+    "enabled": false,
+    "model": "small",
+    "language": "zh",
+    "hf_endpoint": ""
+  },
   "screen_read": {
     "enabled": false,
     "interval_minutes": 10,

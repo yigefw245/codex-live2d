@@ -3,6 +3,7 @@ import base64
 import ctypes
 import json
 import os
+import random
 import re
 import shutil
 import sys
@@ -33,7 +34,7 @@ from PySide6.QtWidgets import (
     QWidgetAction,
 )
 from PySide6.QtWebChannel import QWebChannel
-from PySide6.QtWebEngineCore import QWebEngineSettings
+from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
 import codex_monitor
@@ -434,6 +435,30 @@ SOULLINK_DEFAULTS = {
 
 SOULLINK_MOTION_STYLES = ["natural", "lively", "calm", "shy"]
 
+PROACTIVE_DEFAULTS = {
+    "enabled": False,
+    "interval_minutes": 15,
+    "probability": 70,
+    "min_interval_minutes": 3,
+}
+
+VOICE_INPUT_DEFAULTS = {
+    "enabled": False,
+    "model": "small",
+    "language": "zh",
+    "hf_endpoint": "",
+}
+
+# 未配置聊天接口时主动发言的兜底台词
+PROACTIVE_FALLBACK_LINES = [
+    "嗯……在忙什么呀？",
+    "我刚刚发了一会儿呆，想你了。",
+    "要不要休息一下，喝口水？",
+    "窗外的风好像挺舒服的。",
+    "嘿嘿，我在这里陪着你哦。",
+    "今天也要加油鸭！",
+]
+
 MENU_QSS = """
 QMenu {
     background-color: rgba(26, 28, 36, 242);
@@ -636,6 +661,65 @@ def save_soullink_config(cfg):
         json.dump(root, f, ensure_ascii=False, indent=2)
 
 
+def load_proactive_config():
+    """读取主动发言配置：开关、平均间隔、概率、最短间隔。"""
+    cfg = dict(PROACTIVE_DEFAULTS)
+    try:
+        with open(os.path.join(BASE_DIR, "config.json"), encoding="utf-8") as f:
+            saved = (json.load(f).get("proactive_speech") or {})
+        if isinstance(saved.get("enabled"), bool):
+            cfg["enabled"] = saved["enabled"]
+        for key in ("interval_minutes", "probability", "min_interval_minutes"):
+            try:
+                cfg[key] = max(1, int(saved.get(key, cfg[key])))
+            except (TypeError, ValueError):
+                pass
+        cfg["probability"] = min(100, cfg["probability"])
+    except Exception:
+        pass
+    return cfg
+
+
+def save_proactive_config(cfg):
+    config_path = os.path.join(BASE_DIR, "config.json")
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            root = json.load(f)
+    except Exception:
+        root = {}
+    root["proactive_speech"] = cfg
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(root, f, ensure_ascii=False, indent=2)
+
+
+def load_voice_input_config():
+    """读取语音输入配置：开关 + 本地识别模型（RealtimeSTT / faster-whisper）。"""
+    cfg = dict(VOICE_INPUT_DEFAULTS)
+    try:
+        with open(os.path.join(BASE_DIR, "config.json"), encoding="utf-8") as f:
+            saved = (json.load(f).get("voice_input") or {})
+        if isinstance(saved.get("enabled"), bool):
+            cfg["enabled"] = saved["enabled"]
+        for key in ("model", "language", "hf_endpoint"):
+            if isinstance(saved.get(key), str) and saved[key].strip():
+                cfg[key] = saved[key].strip()
+    except Exception:
+        pass
+    return cfg
+
+
+def save_voice_input_config(cfg):
+    config_path = os.path.join(BASE_DIR, "config.json")
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            root = json.load(f)
+    except Exception:
+        root = {}
+    root["voice_input"] = cfg
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(root, f, ensure_ascii=False, indent=2)
+
+
 EMOTION_KEYWORDS = {
     "happy": [
         "哈哈", "开心", "高兴", "太好了", "真棒", "爱你", "耶", "可爱",
@@ -750,6 +834,109 @@ class VisionClient:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             data = json.loads(response.read().decode("utf-8"))
         return str(data["choices"][0]["message"]["content"]).strip()
+
+
+class LocalVoiceRecognizer:
+    """本地语音识别：RealtimeSTT + faster-whisper，录音和识别都在本机完成。"""
+
+    def __init__(self, cfg):
+        cfg = cfg or {}
+        self.model = str(cfg.get("model") or VOICE_INPUT_DEFAULTS["model"])
+        self.language = str(cfg.get("language") or VOICE_INPUT_DEFAULTS["language"])
+        self.hf_endpoint = str(cfg.get("hf_endpoint") or "").strip()
+        self._recorder = None
+        self._ready = False
+        self._recording = False
+        self._error = ""
+        self._lock = threading.Lock()
+
+    def ready(self):
+        return self._ready
+
+    def error(self):
+        return self._error
+
+    def _create(self):
+        """创建 RealtimeSTT 录音器（应在工作线程中调用）。"""
+        from RealtimeSTT import AudioToTextRecorder
+
+        if self.hf_endpoint:
+            os.environ["HF_ENDPOINT"] = self.hf_endpoint
+        # 走普通 HTTPS 下载模型，避免部分网络下 xet 通道连接不上
+        os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+        return AudioToTextRecorder(
+            model=self.model,
+            language=self.language or "",
+            device="cpu",
+            compute_type="int8",
+            spinner=False,
+            no_log_file=True,
+            ensure_sentence_starting_uppercase=False,
+            ensure_sentence_ends_with_period=False,
+            use_microphone=True,
+        )
+
+    def start(self):
+        """开始录音（首次会自动加载本地模型，可能较慢）。"""
+        with self._lock:
+            if self._recording:
+                return True
+            need_create = self._recorder is None
+        if need_create:
+            try:
+                recorder = self._create()
+            except Exception as exc:
+                self._error = f"语音模型加载失败：{exc}"
+                return False
+            with self._lock:
+                if self._recorder is not None:
+                    # 创建期间被关闭/重建，释放新实例
+                    try:
+                        recorder.shutdown()
+                    except Exception:
+                        pass
+                    return False
+                self._recorder = recorder
+                self._ready = True
+                self._error = ""
+        with self._lock:
+            if self._recorder is None:
+                return False
+            recorder = self._recorder
+            try:
+                recorder.start()
+            except Exception as exc:
+                self._error = f"麦克风启动失败：{exc}"
+                return False
+            self._recording = True
+            return True
+
+    def stop_and_transcribe(self):
+        """停止录音并返回识别文本（阻塞直到识别完成）。"""
+        with self._lock:
+            recorder = self._recorder
+            if recorder is None or not self._recording:
+                self._error = "还没有开始录音"
+                return ""
+            self._recording = False
+        try:
+            recorder.stop()
+            return str(recorder.text() or "").strip()
+        except Exception as exc:
+            self._error = f"语音识别失败：{exc}"
+            return ""
+
+    def shutdown(self):
+        with self._lock:
+            recorder = self._recorder
+            self._recorder = None
+            self._ready = False
+            self._recording = False
+        if recorder is not None:
+            try:
+                recorder.shutdown()
+            except Exception:
+                pass
 
 
 class ChatSettingsDialog(QDialog):
@@ -926,6 +1113,130 @@ class SoullinkSettingsDialog(QDialog):
         }
 
 
+class ProactiveSettingsDialog(QDialog):
+    """主动发言设置：平均间隔 + 开口概率 + 最短间隔。"""
+
+    def __init__(self, cfg, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("主动发言设置")
+        self.setModal(True)
+        self.setMinimumWidth(420)
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.interval_spin = QSpinBox()
+        self.interval_spin.setRange(1, 240)
+        self.interval_spin.setValue(int(cfg.get("interval_minutes", 15)))
+        self.interval_spin.setSuffix(" 分钟")
+
+        self.probability_spin = QSpinBox()
+        self.probability_spin.setRange(1, 100)
+        self.probability_spin.setValue(int(cfg.get("probability", 70)))
+        self.probability_spin.setSuffix(" %")
+
+        self.min_interval_spin = QSpinBox()
+        self.min_interval_spin.setRange(1, 60)
+        self.min_interval_spin.setValue(int(cfg.get("min_interval_minutes", 3)))
+        self.min_interval_spin.setSuffix(" 分钟")
+
+        form.addRow("平均间隔", self.interval_spin)
+        form.addRow("开口概率", self.probability_spin)
+        form.addRow("最短间隔", self.min_interval_spin)
+        layout.addLayout(form)
+
+        hint = QLabel(
+            "不是定时说话，而是每过一分钟按概率“掷一次骰子”：间隔越短、概率越高，"
+            "说得越勤；间隔越长，时间点越随机。\n"
+            "最短间隔用于防止连续说个没完。已配置聊天接口时会用角色人设生成内容，"
+            "未配置则使用内置台词。"
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #888;")
+        layout.addWidget(hint)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def values(self):
+        return {
+            "interval_minutes": self.interval_spin.value(),
+            "probability": self.probability_spin.value(),
+            "min_interval_minutes": self.min_interval_spin.value(),
+        }
+
+
+class VoiceInputSettingsDialog(QDialog):
+    """语音输入设置：本地识别模型（RealtimeSTT / faster-whisper）。"""
+
+    def __init__(self, cfg, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("语音输入设置")
+        self.setModal(True)
+        self.setMinimumWidth(440)
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.model_combo = QComboBox()
+        model_options = [
+            ("tiny（最快，精度一般）", "tiny"),
+            ("base（较快）", "base"),
+            ("small（推荐，中文效果较好）", "small"),
+            ("medium（较慢，更准）", "medium"),
+            ("large（最准，最慢）", "large"),
+        ]
+        current_model = str(cfg.get("model") or "small")
+        for label, value in model_options:
+            self.model_combo.addItem(label, value)
+        idx = self.model_combo.findData(current_model)
+        self.model_combo.setCurrentIndex(idx if idx >= 0 else 2)
+
+        self.language_combo = QComboBox()
+        language_options = [
+            ("中文", "zh"),
+            ("English", "en"),
+            ("日本語", "ja"),
+            ("自动检测", ""),
+        ]
+        current_lang = str(cfg.get("language") or "zh")
+        for label, value in language_options:
+            self.language_combo.addItem(label, value)
+        idx = self.language_combo.findData(current_lang)
+        self.language_combo.setCurrentIndex(idx if idx >= 0 else 0)
+
+        form.addRow("识别模型", self.model_combo)
+        form.addRow("识别语言", self.language_combo)
+        self.endpoint_edit = QLineEdit(str(cfg.get("hf_endpoint", "")).strip())
+        self.endpoint_edit.setPlaceholderText("例如 https://hf-mirror.com（默认留空）")
+        form.addRow("模型下载镜像", self.endpoint_edit)
+        layout.addLayout(form)
+
+        hint = QLabel(
+            "在聊天模式输入框左侧点 🎤 开始录音，再点一次结束并识别成文字填入输入框。\n"
+            "识别在本机完成（RealtimeSTT + faster-whisper），不经过任何云端 API；\n"
+            "首次使用会自动下载所选模型（small 约 460MB），之后离线可用；\n"
+            "若下载失败/太慢，可在“模型下载镜像”填 https://hf-mirror.com 后重试。"
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #888;")
+        layout.addWidget(hint)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def values(self):
+        return {
+            "model": str(self.model_combo.currentData() or "small"),
+            "language": str(self.language_combo.currentData() or ""),
+            "hf_endpoint": self.endpoint_edit.text().strip(),
+        }
+
+
 class PetBridge(QObject):
     """JS -> Python calls (menu, drag, chat)."""
 
@@ -961,11 +1272,19 @@ class PetBridge(QObject):
     def back_to_codex(self):
         self.window.set_chat_mode(False)
 
+    @Slot()
+    def voice_toggle(self):
+        self.window.toggle_voice_recording()
+
+
 class PetWindow(QWidget):
     chat_reply = Signal(str)
     soullink_event = Signal(str)
     soullink_js = Signal(str)
     soullink_status = Signal(str)
+    voice_text = Signal(str)
+    voice_ui = Signal(str)
+    voice_status = Signal(str)
 
     def __init__(self):
         super().__init__()
@@ -1014,6 +1333,26 @@ class PetWindow(QWidget):
         self.soullink_status.connect(self._notify)
         if self.soullink_cfg.get("enabled"):
             QTimer.singleShot(0, self._start_soullink_async)
+        self.proactive_cfg = load_proactive_config()
+        self.proactive_timer = QTimer(self)
+        self.proactive_timer.setInterval(60 * 1000)
+        self.proactive_timer.timeout.connect(self._proactive_tick)
+        self.last_proactive_ts = 0.0
+        self.proactive_busy = False
+        if self.proactive_cfg.get("enabled"):
+            self.last_proactive_ts = time.monotonic()
+            self.proactive_timer.start()
+        self.voice_cfg = load_voice_input_config()
+        self.voice_recognizer = LocalVoiceRecognizer(self.voice_cfg)
+        self.voice_recording = False
+        self.voice_busy = False
+        self.voice_text.connect(
+            lambda text: self._run_js(
+                f"window.setVoiceText({json.dumps(text)})"
+            )
+        )
+        self.voice_ui.connect(self._run_js)
+        self.voice_status.connect(self._notify)
         self.dragging = False
         self.drag_start_pos = None
         self.drag_start_window = None
@@ -1031,6 +1370,9 @@ class PetWindow(QWidget):
         settings.setAttribute(QWebEngineSettings.JavascriptEnabled, True)
         settings.setAttribute(
             QWebEngineSettings.LocalContentCanAccessRemoteUrls, True
+        )
+        self.view.page().featurePermissionRequested.connect(
+            self._grant_mic_permission
         )
 
         self.channel = QWebChannel(self.view.page())
@@ -1144,6 +1486,9 @@ class PetWindow(QWidget):
         )
         self._run_js(f"window.setPetState({json.dumps(self.state)})")
         self._run_js(f"window.setScale({self.scale})")
+        self._run_js(
+            f"window.setVoiceInputEnabled({str(bool(self.voice_cfg.get('enabled'))).lower()})"
+        )
         self._push_soullink_config()
 
     def set_state(self, name):
@@ -1369,6 +1714,14 @@ class PetWindow(QWidget):
         self.soullink_runner.stop()
         self.soullink_ready = False
         self._run_js("window.setSoullinkEnabled(false)")
+        self.proactive_cfg["enabled"] = False
+        save_proactive_config(self.proactive_cfg)
+        self.proactive_timer.stop()
+        self.voice_cfg["enabled"] = False
+        save_voice_input_config(self.voice_cfg)
+        self.voice_recording = False
+        self.voice_recognizer.shutdown()
+        self._run_js("window.setVoiceInputEnabled(false)")
         self.apply_geometry()
         self.move_to_saved_position()
         self.view.resize(self.width(), self.height())
@@ -1450,6 +1803,178 @@ class PetWindow(QWidget):
         with open(config_path, "w", encoding="utf-8") as f:
             json.dump(root, f, ensure_ascii=False, indent=2)
         self.chat_client = ChatClient(load_chat_config())
+
+    # ---------- 主动发言 ----------
+
+    def set_proactive_enabled(self, enabled):
+        enabled = bool(enabled)
+        self.proactive_cfg["enabled"] = enabled
+        save_proactive_config(self.proactive_cfg)
+        if enabled:
+            self.last_proactive_ts = time.monotonic()
+            self.proactive_timer.start()
+            self._notify(
+                f"主动发言已开启（平均约 {self.proactive_cfg.get('interval_minutes', 15)} 分钟一次）"
+            )
+        else:
+            self.proactive_timer.stop()
+            self._notify("主动发言已关闭")
+
+    def open_proactive_settings(self):
+        cfg = load_proactive_config()
+        dialog = ProactiveSettingsDialog(cfg, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        data = dialog.values()
+        self.proactive_cfg.update(data)
+        self.proactive_cfg["enabled"] = bool(self.proactive_cfg.get("enabled"))
+        save_proactive_config(self.proactive_cfg)
+        if self.proactive_cfg.get("enabled"):
+            self.last_proactive_ts = time.monotonic()
+            self._notify(
+                f"主动发言设置已更新（平均约 {self.proactive_cfg.get('interval_minutes')} 分钟一次）"
+            )
+
+    def _proactive_tick(self):
+        if not self.proactive_cfg.get("enabled"):
+            return
+        if self.proactive_busy or self.screen_read_busy or self.chat_mode:
+            return
+        now = time.monotonic()
+        elapsed = now - self.last_proactive_ts
+        interval = max(1, int(self.proactive_cfg.get("interval_minutes", 15))) * 60
+        min_interval = (
+            max(1, int(self.proactive_cfg.get("min_interval_minutes", 3))) * 60
+        )
+        if elapsed < min_interval:
+            return
+        # 每分钟“掷一次骰子”：概率随经过时间线性增长，时间越久越可能开口，
+        # 但具体时机是随机的，不是固定节奏。
+        base_p = int(self.proactive_cfg.get("probability", 70)) / 100.0
+        p = base_p * min(1.0, elapsed / interval) * (60.0 / interval)
+        if random.random() >= p:
+            return
+        self.last_proactive_ts = now
+        self.proactive_busy = True
+        threading.Thread(target=self._proactive_worker, daemon=True).start()
+
+    def _proactive_worker(self):
+        try:
+            reply = None
+            if self.chat_client and self.chat_client.ready():
+                prompt = (
+                    "（主动发言）使用者现在没有在和你说话，也许在忙别的。"
+                    "请以你的人物设定，主动说一句简短自然的话（一两句话），"
+                    "可以是关心、碎碎念、自言自语或分享此刻的心情。"
+                    "不要使用 Markdown，不要提及你是 AI 或模型，不要加引号。"
+                )
+                reply = self.chat_client.chat([], prompt)
+            if not reply:
+                reply = random.choice(PROACTIVE_FALLBACK_LINES)
+        except Exception as exc:
+            reply = random.choice(PROACTIVE_FALLBACK_LINES)
+        finally:
+            self.proactive_busy = False
+        self._emit_speech(reply)
+
+    def _emit_speech(self, reply):
+        """把一句台词交给 Soullink（带 TTS）或普通气泡显示。"""
+        reply = str(reply or "").strip()
+        if not reply:
+            return
+        if self._soullink_usable():
+            try:
+                intent = self.soullink_runner.classify(reply)
+            except Exception:
+                intent = None
+            if intent:
+                self.soullink_event.emit(
+                    json.dumps(
+                        {"reply": reply, "intent": intent},
+                        ensure_ascii=False,
+                    )
+                )
+                return
+        self.chat_reply.emit(reply)
+
+    # ---------- 语音输入 ----------
+
+    def _grant_mic_permission(self, url, feature):
+        if feature == QWebEnginePage.Feature.MediaAudioCapture:
+            self.view.page().setFeaturePermission(
+                url, feature, QWebEnginePage.PermissionGrantedByUser
+            )
+
+    def set_voice_input_enabled(self, enabled):
+        enabled = bool(enabled)
+        self.voice_cfg["enabled"] = enabled
+        save_voice_input_config(self.voice_cfg)
+        if not enabled and self.voice_recording:
+            self.voice_recording = False
+            self._run_js("window.setVoiceRecording(false)")
+        if not enabled:
+            self.voice_recognizer.shutdown()
+        self._run_js(f"window.setVoiceInputEnabled({str(enabled).lower()})")
+        self._notify("语音输入已开启（聊天框左侧 🎤）" if enabled else "语音输入已关闭")
+
+    def open_voice_input_settings(self):
+        cfg = load_voice_input_config()
+        dialog = VoiceInputSettingsDialog(cfg, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        data = dialog.values()
+        if self.voice_recording:
+            self.voice_recording = False
+            self._run_js("window.setVoiceRecording(false)")
+        self.voice_recognizer.shutdown()
+        self.voice_cfg.update(data)
+        self.voice_cfg["enabled"] = bool(self.voice_cfg.get("enabled"))
+        save_voice_input_config(self.voice_cfg)
+        self.voice_recognizer = LocalVoiceRecognizer(self.voice_cfg)
+        self._notify("语音输入设置已更新")
+
+    def toggle_voice_recording(self):
+        if not self.voice_cfg.get("enabled"):
+            self._notify("语音输入未开启，请在菜单中开启")
+            return
+        if self.voice_busy:
+            return
+        if self.voice_recording:
+            self.voice_recording = False
+            self.voice_busy = True
+            self._run_js("window.setVoiceRecording(false)")
+            self._notify("录音结束，正在识别…")
+
+            def _finish():
+                try:
+                    text = self.voice_recognizer.stop_and_transcribe()
+                finally:
+                    self.voice_busy = False
+                if not text:
+                    self.voice_status.emit(
+                        self.voice_recognizer.error() or "没听清，再说一次？"
+                    )
+                    return
+                self.voice_text.emit(text)
+
+            threading.Thread(target=_finish, daemon=True).start()
+            return
+
+        def _begin():
+            if not self.voice_recognizer.start():
+                self.voice_busy = False
+                self.voice_status.emit(
+                    self.voice_recognizer.error() or "语音识别启动失败"
+                )
+                return
+            self.voice_recording = True
+            self.voice_busy = False
+            self.voice_ui.emit("window.setVoiceRecording(true)")
+            self.voice_status.emit("🎤 正在录音，再说一次结束")
+
+        self.voice_busy = True
+        self._notify("正在启动本地语音识别…")
+        threading.Thread(target=_begin, daemon=True).start()
 
     # ---------- 读屏幕 ----------
 
@@ -1969,6 +2494,38 @@ class PetWindow(QWidget):
             menu.addAction(
                 QAction("聊天设置…", self, triggered=self.open_chat_settings)
             )
+            proactive_menu = _new_menu("主动发言", menu)
+            menu.addMenu(proactive_menu)
+            proactive_toggle = QAction(
+                "开启主动发言", self, checkable=True
+            )
+            proactive_toggle.setChecked(
+                bool(self.proactive_cfg.get("enabled"))
+            )
+            proactive_toggle.triggered.connect(self.set_proactive_enabled)
+            proactive_menu.addAction(proactive_toggle)
+            proactive_menu.addAction(
+                QAction(
+                    "主动发言设置…",
+                    self,
+                    triggered=self.open_proactive_settings,
+                )
+            )
+            voice_menu = _new_menu("语音输入", menu)
+            menu.addMenu(voice_menu)
+            voice_toggle_action = QAction(
+                "开启语音输入", self, checkable=True
+            )
+            voice_toggle_action.setChecked(bool(self.voice_cfg.get("enabled")))
+            voice_toggle_action.triggered.connect(self.set_voice_input_enabled)
+            voice_menu.addAction(voice_toggle_action)
+            voice_menu.addAction(
+                QAction(
+                    "语音输入设置…",
+                    self,
+                    triggered=self.open_voice_input_settings,
+                )
+            )
             screen_menu = _new_menu("读屏幕", menu)
             menu.addMenu(screen_menu)
             screen_toggle = QAction("开启读屏幕", self, checkable=True)
@@ -2069,6 +2626,10 @@ class PetWindow(QWidget):
             pass
         try:
             self.soullink_runner.stop()
+        except Exception:
+            pass
+        try:
+            self.voice_recognizer.shutdown()
         except Exception:
             pass
         app = QApplication.instance()

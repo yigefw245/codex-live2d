@@ -82,6 +82,25 @@ html, body {
   font-size: 14px;
   outline: none;
 }
+#chat-mic {
+  display: none;
+  border-radius: 10px;
+  border: 1px solid #3a5a78;
+  background: rgba(255, 255, 255, 0.09);
+  color: #fff;
+  width: 38px;
+  font-size: 17px;
+  cursor: pointer;
+  transition: background 0.2s, box-shadow 0.2s;
+}
+#chat-mic.show {
+  display: block;
+}
+#chat-mic.recording {
+  background: #c0392b;
+  border-color: #e74c3c;
+  box-shadow: 0 0 12px rgba(231, 76, 60, 0.7);
+}
 #chat-send {
   border-radius: 10px;
   border: none;
@@ -100,6 +119,7 @@ html, body {
   <div id="chat-input-row">
     <button id="chat-back" title="返回 Codex 模式">←</button>
     <input id="chat-input" type="text" placeholder="和 yumi 说点什么…" autocomplete="off" />
+    <button id="chat-mic" title="语音输入">🎤</button>
     <button id="chat-send">发送</button>
   </div>
 </div>

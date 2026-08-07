@@ -846,6 +846,28 @@ window.chatReact = chatReact;
 window.refit = reposition;
 window.setScale = setScale;
 
+const chatMicEl = document.getElementById("chat-mic");
+
+window.setVoiceInputEnabled = (on) => {
+  chatMicEl.classList.toggle("show", !!on);
+  if (!on) chatMicEl.classList.remove("recording");
+};
+
+window.setVoiceRecording = (on) => {
+  chatMicEl.classList.toggle("recording", !!on);
+};
+
+window.setVoiceText = (text) => {
+  if (typeof text !== "string") return;
+  chatInputEl.value = text;
+  chatInputEl.focus();
+  chatInputEl.setSelectionRange(text.length, text.length);
+};
+
+chatMicEl.addEventListener("click", () => {
+  if (window.__bridge) window.__bridge.voice_toggle();
+});
+
 document.getElementById("chat-send").addEventListener("click", sendChat);
 chatInputEl.addEventListener("keydown", (e) => {
   if (e.key === "Enter") sendChat();

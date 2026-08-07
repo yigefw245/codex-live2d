@@ -1,6 +1,6 @@
 # Codex Live2D 桌宠
 
-> **v2.0.0**：新增读屏幕、Soullink 情绪引擎（Embedding 情绪分类 + SDK 动作系统 + TTS 朗读，可作为开关切换，关闭即恢复原有关键词模式）。详见 [CHANGELOG.md](CHANGELOG.md)。
+> **v2.0.4**：新增主动发言（概率制、参数可调）与语音输入（RealtimeSTT 本地识别，不上传音频）。详见 [CHANGELOG.md](CHANGELOG.md)。
 
 一个基于 Live2D 模型的透明桌面宠物：实时渲染、眼神跟随鼠标，并且能感知 Codex 的运行状态自动切换动作和表情；还内置了角色聊天模式，可以像朋友一样和角色对话。内置 **yumi** 模型，支持随时切换或导入其他 Live2D 模型。
 
@@ -56,6 +56,7 @@ cd codex-live2d
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -U pip
 .\.venv\Scripts\python.exe -m pip install PySide6
+.\.venv\Scripts\python.exe -m pip install "RealtimeSTT[faster-whisper]"
 ```
 
 ### 2. 配置聊天接口（可选，不配置也能用 Codex 状态模式）
