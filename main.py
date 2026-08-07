@@ -28,9 +28,12 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMenu,
     QMessageBox,
     QPlainTextEdit,
+    QScrollArea,
     QSlider,
     QSpinBox,
     QVBoxLayout,
@@ -498,6 +501,26 @@ VOICE_CHAT_DEFAULTS = {
 
 # 这类“（…）”开头的回复属于错误提示，不朗读
 VOICE_ERROR_PREFIXES = ("（连接失败", "（读屏幕", "（Soullink", "（还没")
+
+# Soullink 情绪集合（用于“情绪→动作姿势”自定义）
+SOULLINK_EMOTIONS = [
+    ("happy", "开心"),
+    ("excited", "兴奋"),
+    ("shy", "害羞"),
+    ("affectionate", "亲昵"),
+    ("neutral", "中性"),
+    ("calm", "冷静"),
+    ("curious", "好奇"),
+    ("confused", "疑惑"),
+    ("surprised", "惊讶"),
+    ("sad", "难过"),
+    ("teary", "想哭"),
+    ("anxiety", "焦虑"),
+    ("tired", "累"),
+    ("concerned", "担心"),
+    ("anger", "生气"),
+    ("angry", "生气"),
+]
 
 
 def _voice_chat_diag(text):
@@ -1822,6 +1845,115 @@ class SoullinkSettingsDialog(QDialog):
         }
 
 
+class SoullinkActionsDialog(QDialog):
+    """选择当前模型的 Soullink 待机动作姿势（扶脸/看手机/记笔记等，按模型自定义）。"""
+
+    def __init__(self, expressions, current, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("选择待机动作姿势")
+        self.setModal(True)
+        self.setMinimumWidth(360)
+
+        layout = QVBoxLayout(self)
+        hint = QLabel(
+            "勾选想让桌宠待机时随机做的动作姿势（如扶脸、看手机、记笔记等）。\n"
+            "只有模型自带的表情会显示在这里；不勾选则用默认姿势。"
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #888;")
+        layout.addWidget(hint)
+
+        self.list_widget = QListWidget()
+        current = set(current or [])
+        for key, info in expressions.items():
+            label = (
+                info.get("label", key)
+                if isinstance(info, dict)
+                else key
+            )
+            item = QListWidgetItem(f"{label}（{key}）")
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.Checked if key in current else Qt.Unchecked
+            )
+            item.setData(Qt.UserRole, key)
+            self.list_widget.addItem(item)
+        layout.addWidget(self.list_widget)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def values(self):
+        keys = []
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            if item.checkState() == Qt.Checked:
+                key = item.data(Qt.UserRole)
+                if key:
+                    keys.append(str(key))
+        return keys
+
+
+class SoullinkEmotionActionsDialog(QDialog):
+    """按模型自定义“情绪 → 动作姿势”映射（如 累 → 看手机）。"""
+
+    def __init__(self, expressions, current, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("选择情绪动作")
+        self.setModal(True)
+        self.setMinimumWidth(420)
+
+        outer = QVBoxLayout(self)
+        hint = QLabel(
+            "为每个情绪选择对应的动作姿势（如 累 → 看手机、好奇 → 扶脸）。\n"
+            "选“默认”则使用生成器自带映射；不选默认姿势时该情绪不触发额外动作。"
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #888;")
+        outer.addWidget(hint)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        body = QWidget()
+        form = QFormLayout(body)
+        self.combos = {}
+        options = [("", "默认")] + [
+            (
+                key,
+                (
+                    info.get("label", key)
+                    if isinstance(info, dict)
+                    else key
+                ),
+            )
+            for key, info in expressions.items()
+        ]
+        for emotion, label in SOULLINK_EMOTIONS:
+            combo = QComboBox()
+            for key, opt_label in options:
+                combo.addItem(opt_label, key)
+            idx = combo.findData(str(current.get(emotion) or ""))
+            combo.setCurrentIndex(max(0, idx))
+            self.combos[emotion] = combo
+            form.addRow(label, combo)
+        scroll.setWidget(body)
+        outer.addWidget(scroll)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        outer.addWidget(buttons)
+
+    def values(self):
+        return {
+            emotion: str(combo.currentData() or "")
+            for emotion, combo in self.combos.items()
+            if combo.currentData()
+        }
+
+
 class ProactiveSettingsDialog(QDialog):
     """主动发言设置：平均间隔 + 开口概率 + 最短间隔。"""
 
@@ -2390,6 +2522,11 @@ class PetWindow(QWidget):
     def sync_page_state(self):
         self._run_js(
             f"window.setModelConfig({json.dumps(self.model_cfg, ensure_ascii=False)})"
+        )
+        actions = self.model_cfg.get("soullink_actions")
+        self._run_js(
+            f"window.setSoullinkActions("
+            f"{json.dumps(actions or None, ensure_ascii=False)})"
         )
         self._run_js(
             f"window.setActionOverrides("
@@ -3912,6 +4049,77 @@ class PetWindow(QWidget):
             else:
                 self._run_js("window.setSoullinkEnabled(false)")
 
+    def open_soullink_actions(self):
+        """选择当前模型的 Soullink 待机动作姿势（每个模型可自定义）。"""
+        expressions = self.model_cfg.get("expressions") or {}
+        if not expressions:
+            self._notify("当前模型没有可用的表情/姿势")
+            return
+        current = self.model_cfg.get("soullink_actions") or []
+        dialog = SoullinkActionsDialog(expressions, current, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        keys = dialog.values()
+        model_path = os.path.join(MODEL_DIR, self.model_id, "model.json")
+        try:
+            with open(model_path, encoding="utf-8") as f:
+                cfg = json.load(f)
+            cfg["soullink_actions"] = keys
+            with open(model_path, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+            self.model_cfg = load_model_config(self.model_id) or {}
+        except Exception:
+            pass
+        self._run_js(
+            f"window.setSoullinkActions("
+            f"{json.dumps(keys, ensure_ascii=False)})"
+        )
+        self._notify(
+            f"待机动作已更新：{len(keys)} 个"
+            if keys
+            else "待机动作已清空（使用默认姿势）"
+        )
+
+    def open_soullink_emotion_actions(self):
+        """按模型自定义“情绪 → 动作姿势”映射（如 累 → 看手机）。"""
+        expressions = self.model_cfg.get("expressions") or {}
+        if not expressions:
+            self._notify("当前模型没有可用的表情/姿势")
+            return
+        current = self.model_cfg.get("soullink_emotion_actions") or {}
+        dialog = SoullinkEmotionActionsDialog(expressions, current, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        actions = dialog.values()
+        model_path = os.path.join(MODEL_DIR, self.model_id, "model.json")
+        try:
+            with open(model_path, encoding="utf-8") as f:
+                cfg = json.load(f)
+            cfg["soullink_emotion_actions"] = actions
+            with open(model_path, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+            self.model_cfg = load_model_config(self.model_id) or {}
+        except Exception:
+            pass
+        # 同步写入 profile 的 expressionMap，并让 SDK 重新加载
+        profile_path = os.path.join(
+            MODEL_DIR, self.model_id, "soullink.profile.json"
+        )
+        try:
+            with open(profile_path, encoding="utf-8") as f:
+                profile = json.load(f)
+            expr_map = profile.get("expressionMap") or {}
+            for emotion, key in actions.items():
+                expr_map[emotion] = key
+            profile["expressionMap"] = expr_map
+            with open(profile_path, "w", encoding="utf-8") as f:
+                json.dump(profile, f, ensure_ascii=False, indent=2)
+            if self.soullink_cfg.get("enabled"):
+                self.soullink_js.emit("window.soullinkRestart()")
+        except Exception:
+            pass
+        self._notify("情绪动作已更新")
+
     def regenerate_soullink_profile(self):
         """手动重新生成当前模型的 Soullink profile（强制覆盖）。"""
 
@@ -4302,6 +4510,20 @@ class PetWindow(QWidget):
                     "生成/更新当前模型 profile…",
                     self,
                     triggered=self.regenerate_soullink_profile,
+                )
+            )
+            soullink_menu.addAction(
+                QAction(
+                    "选择待机动作姿势…",
+                    self,
+                    triggered=self.open_soullink_actions,
+                )
+            )
+            soullink_menu.addAction(
+                QAction(
+                    "选择情绪动作…",
+                    self,
+                    triggered=self.open_soullink_emotion_actions,
                 )
             )
             menu.addSeparator()

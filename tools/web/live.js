@@ -18,6 +18,7 @@ let userCropBottom = 0;
 let idlePoseName = null;
 let idlePoseEndAt = 0;
 let nextIdlePoseAt = 0;
+let soullinkActions = null;
 let soullink = { enabled: false, config: null, bridge: null, starting: null };
 
 function soullinkEnabled() {
@@ -759,9 +760,8 @@ function onFrame(ts) {
     // （眼神全量跟随，头部/身体减半幅度，避免完全盖掉情绪姿态）。
     // 待机小动作：长时间没互动时随机做扶脸/看手机/记笔记/前倾等姿势。
     if (!idlePoseName && t >= nextIdlePoseAt && model.expression) {
-      const poses = ["hand", "phone", "notes", "lean"].filter(
-        (name) => EXPR_DATA[name]
-      );
+      const posePool = soullinkActions || ["hand", "phone", "notes", "lean"];
+      const poses = posePool.filter((name) => EXPR_DATA[name]);
       if (poses.length && Math.random() < 0.7) {
         idlePoseName = poses[Math.floor(Math.random() * poses.length)];
         idlePoseEndAt = t + 4 + Math.random() * 3;
@@ -918,6 +918,11 @@ window.setCropBottom = (v) => {
     fitModel();
     reportBounds();
   }
+};
+
+// 当前模型的 Soullink 待机动作姿势列表（每个模型可自定义）。
+window.setSoullinkActions = (keys) => {
+  soullinkActions = Array.isArray(keys) && keys.length ? keys : null;
 };
 window.setScale = setScale;
 

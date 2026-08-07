@@ -84,6 +84,34 @@ async function extendExpressionMap(profilePath) {
   await writeFile(profilePath, JSON.stringify(profile, null, 2) + "\n", "utf8");
 }
 
+// 把 model.json 里用户自定义的“情绪 → 动作姿势”映射写进 profile，
+// 保证重新生成 profile 后自定义配置不丢失。
+async function applyCustomEmotionActions(profilePath, modelDir) {
+  let profile;
+  let modelCfg;
+  try {
+    profile = JSON.parse(await readFile(profilePath, "utf8"));
+    modelCfg = JSON.parse(
+      await readFile(resolve(modelsRoot, modelDir, "model.json"), "utf8")
+    );
+  } catch {
+    return;
+  }
+  const actions = modelCfg?.soullink_emotion_actions;
+  if (!actions || typeof actions !== "object") return;
+  const expressionMap = profile.expressionMap ?? {};
+  let changed = false;
+  for (const [emotion, key] of Object.entries(actions)) {
+    if (key && expressionMap[emotion] !== key) {
+      expressionMap[emotion] = key;
+      changed = true;
+    }
+  }
+  if (!changed) return;
+  profile.expressionMap = expressionMap;
+  await writeFile(profilePath, JSON.stringify(profile, null, 2) + "\n", "utf8");
+}
+
 const results = [];
 for (const modelDir of modelDirs()) {
   const profilePath = resolve(modelsRoot, modelDir, "soullink.profile.json");
@@ -111,6 +139,7 @@ for (const modelDir of modelDirs()) {
     });
     if (result.generated) {
       await extendExpressionMap(profilePath);
+      await applyCustomEmotionActions(profilePath, modelDir);
     }
   } catch (error) {
     results.push({
