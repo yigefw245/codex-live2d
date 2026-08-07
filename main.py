@@ -9,6 +9,7 @@ import shutil
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.error
 import urllib.request
 import zipfile
@@ -449,6 +450,26 @@ VOICE_INPUT_DEFAULTS = {
     "hf_endpoint": "",
 }
 
+STT_CACHE_ROOT = os.path.join(BASE_DIR, ".cache", "stt")
+
+STT_MODEL_REPOS = {
+    "tiny": "Systran/faster-whisper-tiny",
+    "base": "Systran/faster-whisper-base",
+    "small": "Systran/faster-whisper-small",
+    "medium": "Systran/faster-whisper-medium",
+    "large": "Systran/faster-whisper-large-v3",
+}
+
+STT_MODELSCOPE_REPOS = {
+    "tiny": "pengzhendong/faster-whisper-tiny",
+    "base": "pengzhendong/faster-whisper-base",
+    "small": "pengzhendong/faster-whisper-small",
+    "medium": "pengzhendong/faster-whisper-medium",
+    "large": "pengzhendong/faster-whisper-large-v3",
+}
+
+STT_REQUIRED_FILES = ("model.bin", "config.json", "tokenizer.json", "vocabulary.txt")
+
 # 未配置聊天接口时主动发言的兜底台词
 PROACTIVE_FALLBACK_LINES = [
     "嗯……在忙什么呀？",
@@ -849,6 +870,8 @@ class LocalVoiceRecognizer:
         self._recording = False
         self._error = ""
         self._lock = threading.Lock()
+        self._cancel = threading.Event()
+        self._progress_cb = None
 
     def ready(self):
         return self._ready
@@ -856,16 +879,164 @@ class LocalVoiceRecognizer:
     def error(self):
         return self._error
 
+    def cancel(self):
+        self._cancel.set()
+
+    def set_progress_callback(self, cb):
+        self._progress_cb = cb
+
+    def _model_dir(self):
+        return os.path.join(STT_CACHE_ROOT, "whisper-" + self.model)
+
+    def needs_model(self):
+        return not os.path.isfile(
+            os.path.join(self._model_dir(), "model.bin")
+        )
+
+    def _emit_progress(self, text):
+        if self._progress_cb:
+            try:
+                self._progress_cb(text)
+            except Exception:
+                pass
+
+    def _get_json(self, url):
+        request = urllib.request.Request(url)
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def _list_source_files(self, kind, base, repo):
+        """返回 (文件名, 大小) 列表；kind: modelscope / huggingface。"""
+        if kind == "modelscope":
+            url = (
+                f"{base}/api/v1/models/{repo}/repo/files"
+                "?Revision=master&Recursive=true"
+            )
+            data = self._get_json(url)
+            files = (
+                (data.get("Data") or {}).get("Files")
+                or data.get("Files")
+                or []
+            )
+            return [
+                (str(f.get("Path", "")), int(f.get("Size") or 0))
+                for f in files
+            ]
+        url = f"{base}/api/models/{repo}"
+        data = self._get_json(url)
+        return [
+            (str(s.get("rfilename", "")), int(s.get("size") or 0))
+            for s in data.get("siblings", [])
+        ]
+
+    def _source_file_url(self, kind, base, repo, filename):
+        if kind == "modelscope":
+            quoted = urllib.parse.quote(filename)
+            return (
+                f"{base}/api/v1/models/{repo}/repo"
+                f"?Revision=master&FilePath={quoted}"
+            )
+        quoted = urllib.parse.quote(filename)
+        return f"{base}/{repo}/resolve/main/{quoted}"
+
+    def _download_file(self, url, dest, label, expected_size=0):
+        """流式下载单个文件到 dest，带进度回调与取消检查。"""
+        tmp = dest + ".part"
+        os.makedirs(os.path.dirname(tmp), exist_ok=True)
+        request = urllib.request.Request(url)
+        last_report = 0.0
+        with urllib.request.urlopen(request, timeout=60) as response:
+            got = 0
+            with open(tmp, "wb") as f:
+                while True:
+                    if self._cancel.is_set():
+                        raise RuntimeError("下载已取消")
+                    chunk = response.read(262144)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    got += len(chunk)
+                    now = time.monotonic()
+                    if now - last_report >= 2.0:
+                        last_report = now
+                        if expected_size > 0:
+                            percent = got * 100 // expected_size
+                            self._emit_progress(
+                                f"正在下载{label}：{got // 1048576}MB / "
+                                f"{expected_size // 1048576}MB（{percent}%）"
+                            )
+                        else:
+                            self._emit_progress(
+                                f"正在下载{label}：{got // 1048576}MB…"
+                            )
+        if os.path.getsize(tmp) <= 0:
+            os.remove(tmp)
+            raise RuntimeError(f"{label} 下载内容为空")
+        os.replace(tmp, dest)
+
+    def _ensure_model(self):
+        """下载/确认本地 Whisper 模型，按多来源自动回退。"""
+        target = self._model_dir()
+        if os.path.isfile(os.path.join(target, "model.bin")):
+            return target
+        self._cancel.clear()
+        os.makedirs(target, exist_ok=True)
+        hf_repo = STT_MODEL_REPOS.get(self.model) or (
+            f"Systran/faster-whisper-{self.model}"
+        )
+        ms_repo = STT_MODELSCOPE_REPOS.get(self.model, "")
+        sources = []
+        if self.hf_endpoint:
+            sources.append(("huggingface", self.hf_endpoint, hf_repo))
+        sources.append(("modelscope", "https://modelscope.cn", ms_repo))
+        sources.append(("huggingface", "https://hf-mirror.com", hf_repo))
+        sources.append(("huggingface", "https://huggingface.co", hf_repo))
+        errors = []
+        for kind, base, repo in sources:
+            if not repo or self._cancel.is_set():
+                continue
+            self._emit_progress(
+                f"正在从 {base} 下载语音识别模型（首次需要，可能几分钟）…"
+            )
+            try:
+                listing = self._list_source_files(kind, base, repo)
+                by_name = dict(listing)
+                missing = [
+                    name
+                    for name in STT_REQUIRED_FILES
+                    if name in by_name
+                    and not os.path.isfile(os.path.join(target, name))
+                ]
+                for name in sorted(missing):
+                    if self._cancel.is_set():
+                        raise RuntimeError("下载已取消")
+                    self._download_file(
+                        self._source_file_url(kind, base, repo, name),
+                        os.path.join(target, name),
+                        name,
+                        expected_size=by_name.get(name, 0),
+                    )
+                if os.path.isfile(os.path.join(target, "model.bin")):
+                    return target
+                errors.append(f"{base}：缺少 model.bin")
+            except Exception as exc:
+                errors.append(f"{base}：{exc}")
+                continue
+        if self._cancel.is_set():
+            raise RuntimeError("模型下载已取消")
+        detail = "；".join(errors[-2:]) if errors else "未知错误"
+        raise RuntimeError(
+            f"语音模型下载失败，已尝试 {len(errors)} 个来源：{detail}。"
+            "请检查网络后重试。"
+        )
+
     def _create(self):
         """创建 RealtimeSTT 录音器（应在工作线程中调用）。"""
         from RealtimeSTT import AudioToTextRecorder
 
-        if self.hf_endpoint:
-            os.environ["HF_ENDPOINT"] = self.hf_endpoint
-        # 走普通 HTTPS 下载模型，避免部分网络下 xet 通道连接不上
-        os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+        model_path = self._ensure_model()
         return AudioToTextRecorder(
-            model=self.model,
+            model=model_path,
             language=self.language or "",
             device="cpu",
             compute_type="int8",
@@ -1218,7 +1389,9 @@ class VoiceInputSettingsDialog(QDialog):
             "在聊天模式输入框左侧点 🎤 开始录音，再点一次结束并识别成文字填入输入框。\n"
             "识别在本机完成（RealtimeSTT + faster-whisper），不经过任何云端 API；\n"
             "首次使用会自动下载所选模型（small 约 460MB），之后离线可用；\n"
-            "若下载失败/太慢，可在“模型下载镜像”填 https://hf-mirror.com 后重试。"
+            "下载会自动尝试 ModelScope（国内）→ 配置镜像 → hf-mirror.com → "
+            "huggingface.co；\n"
+            "仍失败时可在“模型下载镜像”手动指定可用地址，或手动把模型放进项目 .cache/stt 目录。"
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #888;")
@@ -1346,6 +1519,10 @@ class PetWindow(QWidget):
         self.voice_recognizer = LocalVoiceRecognizer(self.voice_cfg)
         self.voice_recording = False
         self.voice_busy = False
+        self.voice_token = 0
+        self.voice_recognizer.set_progress_callback(
+            lambda text: self.voice_status.emit(text)
+        )
         self.voice_text.connect(
             lambda text: self._run_js(
                 f"window.setVoiceText({json.dumps(text)})"
@@ -1720,6 +1897,9 @@ class PetWindow(QWidget):
         self.voice_cfg["enabled"] = False
         save_voice_input_config(self.voice_cfg)
         self.voice_recording = False
+        self.voice_token += 1
+        self.voice_busy = False
+        self.voice_recognizer.cancel()
         self.voice_recognizer.shutdown()
         self._run_js("window.setVoiceInputEnabled(false)")
         self.apply_geometry()
@@ -1913,6 +2093,9 @@ class PetWindow(QWidget):
             self.voice_recording = False
             self._run_js("window.setVoiceRecording(false)")
         if not enabled:
+            self.voice_token += 1
+            self.voice_busy = False
+            self.voice_recognizer.cancel()
             self.voice_recognizer.shutdown()
         self._run_js(f"window.setVoiceInputEnabled({str(enabled).lower()})")
         self._notify("语音输入已开启（聊天框左侧 🎤）" if enabled else "语音输入已关闭")
@@ -1926,11 +2109,17 @@ class PetWindow(QWidget):
         if self.voice_recording:
             self.voice_recording = False
             self._run_js("window.setVoiceRecording(false)")
+        self.voice_token += 1
+        self.voice_busy = False
+        self.voice_recognizer.cancel()
         self.voice_recognizer.shutdown()
         self.voice_cfg.update(data)
         self.voice_cfg["enabled"] = bool(self.voice_cfg.get("enabled"))
         save_voice_input_config(self.voice_cfg)
         self.voice_recognizer = LocalVoiceRecognizer(self.voice_cfg)
+        self.voice_recognizer.set_progress_callback(
+            lambda text: self.voice_status.emit(text)
+        )
         self._notify("语音输入设置已更新")
 
     def toggle_voice_recording(self):
@@ -1946,10 +2135,13 @@ class PetWindow(QWidget):
             self._notify("录音结束，正在识别…")
 
             def _finish():
+                token = self.voice_token
                 try:
                     text = self.voice_recognizer.stop_and_transcribe()
                 finally:
                     self.voice_busy = False
+                if token != self.voice_token:
+                    return
                 if not text:
                     self.voice_status.emit(
                         self.voice_recognizer.error() or "没听清，再说一次？"
@@ -1961,11 +2153,20 @@ class PetWindow(QWidget):
             return
 
         def _begin():
+            token = self.voice_token
+            if self.voice_recognizer.needs_model():
+                self.voice_status.emit(
+                    "正在下载语音识别模型（首次需要，可能几分钟）…"
+                )
             if not self.voice_recognizer.start():
                 self.voice_busy = False
-                self.voice_status.emit(
-                    self.voice_recognizer.error() or "语音识别启动失败"
-                )
+                if token == self.voice_token:
+                    self.voice_status.emit(
+                        self.voice_recognizer.error() or "语音识别启动失败"
+                    )
+                return
+            if token != self.voice_token:
+                self.voice_busy = False
                 return
             self.voice_recording = True
             self.voice_busy = False
@@ -2629,6 +2830,8 @@ class PetWindow(QWidget):
         except Exception:
             pass
         try:
+            self.voice_token += 1
+            self.voice_recognizer.cancel()
             self.voice_recognizer.shutdown()
         except Exception:
             pass

@@ -56,7 +56,7 @@ cd codex-live2d
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -U pip
 .\.venv\Scripts\python.exe -m pip install PySide6
-.\.venv\Scripts\python.exe -m pip install "RealtimeSTT[faster-whisper]"
+.\.venv\Scripts\python.exe -m pip install "RealtimeSTT[faster-whisper]" silero-vad
 ```
 
 ### 2. 配置聊天接口（可选，不配置也能用 Codex 状态模式）

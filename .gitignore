@@ -12,6 +12,9 @@ pet_*.flag
 dbg_*
 *.tmp
 
+# 语音识别模型缓存（首次使用时下载，禁止提交）
+.cache/
+
 # 系统
 .DS_Store
 Thumbs.db
