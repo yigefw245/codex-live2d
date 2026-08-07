@@ -25,17 +25,6 @@ def _tail(path, size=262144):
     return data
 
 
-def _iso_to_epoch(value):
-    if not isinstance(value, str):
-        return None
-    try:
-        return datetime.datetime.fromisoformat(
-            value.replace("Z", "+00:00")
-        ).timestamp()
-    except Exception:
-        return None
-
-
 def _read_recent_logs(after_ts, limit=2500):
     try:
         conn = sqlite3.connect(
@@ -103,7 +92,6 @@ def get_codex_status():
             "last_finished": None,
         }
     path = max(files, key=os.path.getmtime)
-    mtime = os.path.getmtime(path)
     task = None
     model = None
     progress = None
@@ -115,7 +103,6 @@ def get_codex_status():
             obj = json.loads(line)
             payload = obj.get("payload", {})
             ptype = payload.get("type")
-            line_ts = _iso_to_epoch(obj.get("timestamp"))
             if ptype == "task_started":
                 started = payload.get("started_at")
                 if isinstance(started, (int, float)):

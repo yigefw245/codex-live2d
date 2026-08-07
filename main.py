@@ -10,7 +10,6 @@ import sys
 import threading
 import time
 import urllib.parse
-import urllib.error
 import urllib.request
 import zipfile
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -36,7 +35,7 @@ from PySide6.QtWidgets import (
     QWidgetAction,
 )
 from PySide6.QtWebChannel import QWebChannel
-from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings
+from PySide6.QtWebEngineCore import QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
 import codex_monitor
@@ -1653,10 +1652,6 @@ class PetWindow(QWidget):
         settings.setAttribute(
             QWebEngineSettings.LocalContentCanAccessRemoteUrls, True
         )
-        self.view.page().featurePermissionRequested.connect(
-            self._grant_mic_permission
-        )
-
         self.channel = QWebChannel(self.view.page())
         self.channel.registerObject("pet", self.bridge)
         self.view.page().setWebChannel(self.channel)
@@ -2160,7 +2155,7 @@ class PetWindow(QWidget):
                 reply = self.chat_client.chat([], prompt)
             if not reply:
                 reply = random.choice(PROACTIVE_FALLBACK_LINES)
-        except Exception as exc:
+        except Exception:
             reply = random.choice(PROACTIVE_FALLBACK_LINES)
         finally:
             self.proactive_busy = False
@@ -2187,12 +2182,6 @@ class PetWindow(QWidget):
         self.chat_reply.emit(reply)
 
     # ---------- 语音输入 ----------
-
-    def _grant_mic_permission(self, url, feature):
-        if feature == QWebEnginePage.Feature.MediaAudioCapture:
-            self.view.page().setFeaturePermission(
-                url, feature, QWebEnginePage.PermissionGrantedByUser
-            )
 
     def set_voice_input_enabled(self, enabled):
         enabled = bool(enabled)
@@ -2857,10 +2846,8 @@ class PetWindow(QWidget):
                     sub.addAction(item)
                 for key, info in expressions.items():
                     if isinstance(info, dict):
-                        kind = info.get("kind", "face")
                         expr_label = info.get("label", key)
                     else:
-                        kind = "face"
                         expr_label = key
                     item = QAction(expr_label, self, checkable=True)
                     item.setChecked(

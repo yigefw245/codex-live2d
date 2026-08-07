@@ -55,13 +55,6 @@ function easeInOut(t) {
 
 // ---------- model config helpers ----------
 
-function exprFile(key) {
-  const map = (modelConfig && modelConfig.expressions) || {};
-  const info = map[key];
-  if (!info) return null;
-  return typeof info === "string" ? info : info.file;
-}
-
 function presetFor(state) {
   return (
     (modelConfig && modelConfig.presets && modelConfig.presets[state]) || {}
@@ -824,17 +817,6 @@ window.setActionOverrides = (obj) => {
   actionOverrides = obj || {};
   if (model && modelConfig) applyStateVisuals(currentState);
 };
-window.switchModel = async (id) => {
-  if (!id) return;
-  try {
-    const resp = await fetch(modelUrl({ id: id }, "model.json"));
-    const cfg = await resp.json();
-    if (!cfg || !cfg.model3) return;
-    await loadModel(cfg);
-  } catch (err) {
-    window.__error = String(err && err.stack ? err.stack : err);
-  }
-};
 window.playMotion = playMotion;
 window.stopMotion = stopMotion;
 window.setPetState = setPetState;
@@ -843,7 +825,6 @@ window.notify = showBubble;
 window.setChatMode = setChatMode;
 window.showChatReply = showChatReply;
 window.chatReact = chatReact;
-window.refit = reposition;
 window.setScale = setScale;
 
 const chatMicEl = document.getElementById("chat-mic");
