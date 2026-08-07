@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPlainTextEdit,
+    QSlider,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -65,6 +66,7 @@ DEFAULT_SETTINGS = {
     "locked": True,
     "model": "yumi",
     "actions": {},
+    "crop_bottom": 0.0,
 }
 
 
@@ -443,6 +445,7 @@ SCREEN_LOOK_KEYWORDS = (
 SOULLINK_DEFAULTS = {
     "enabled": False,
     "motion_style": "natural",
+    "motion_intensity": 1.0,
     "embedding": {
         "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
         "api_key": "",
@@ -492,6 +495,22 @@ VOICE_CHAT_DEFAULTS = {
         "language_type": "Chinese",
     },
 }
+
+# 这类“（…）”开头的回复属于错误提示，不朗读
+VOICE_ERROR_PREFIXES = ("（连接失败", "（读屏幕", "（Soullink", "（还没")
+
+
+def _voice_chat_diag(text):
+    """语音对话诊断日志（排障用，不参与功能逻辑）。"""
+    try:
+        with open(
+            os.path.join(BASE_DIR, "voice_chat_diag.log"),
+            "a",
+            encoding="utf-8",
+        ) as f:
+            f.write(f"{time.ctime()} {text}\n")
+    except Exception:
+        pass
 
 MEMORY_DEFAULTS = {
     "enabled": True,
@@ -726,6 +745,7 @@ def load_soullink_config():
     cfg = {
         "enabled": SOULLINK_DEFAULTS["enabled"],
         "motion_style": SOULLINK_DEFAULTS["motion_style"],
+        "motion_intensity": SOULLINK_DEFAULTS["motion_intensity"],
         "embedding": dict(SOULLINK_DEFAULTS["embedding"]),
         "tts": dict(SOULLINK_DEFAULTS["tts"]),
     }
@@ -736,6 +756,12 @@ def load_soullink_config():
             cfg["enabled"] = saved["enabled"]
         if saved.get("motion_style") in SOULLINK_MOTION_STYLES:
             cfg["motion_style"] = saved["motion_style"]
+        try:
+            cfg["motion_intensity"] = max(
+                0.5, min(2.0, float(saved.get("motion_intensity", 1.0)))
+            )
+        except (TypeError, ValueError):
+            pass
         for section in ("embedding", "tts"):
             saved_section = saved.get(section) or {}
             for key in ("base_url", "api_key", "model", "voice", "language_type"):
@@ -996,7 +1022,8 @@ EMOTION_KEYWORDS = {
         "不开心", "遗憾", "😢", "😭",
     ],
     "angry": [
-        "生气", "讨厌", "气死", "烦", "怒", "可恶", "哼", "😠", "😡",
+        "生气", "气死", "气人", "气呼呼", "可恶", "讨厌", "恼火",
+        "愤怒", "发火", "烦死了", "烦人", "😠", "😡",
     ],
     "thinking": [
         "也许", "可能", "考虑", "思考", "应该", "疑惑", "好奇", "为什么",
@@ -1743,6 +1770,12 @@ class SoullinkSettingsDialog(QDialog):
         self.style_combo = QComboBox()
         self.style_combo.addItems(SOULLINK_MOTION_STYLES)
         self.style_combo.setCurrentText(str(cfg.get("motion_style", "natural")))
+        self.intensity_spin = QDoubleSpinBox()
+        self.intensity_spin.setRange(0.5, 2.0)
+        self.intensity_spin.setSingleStep(0.1)
+        self.intensity_spin.setDecimals(1)
+        self.intensity_spin.setValue(float(cfg.get("motion_intensity", 1.0)))
+        self.intensity_spin.setSuffix(" 倍")
 
         form.addRow("Embedding API 地址", self.embed_base_edit)
         form.addRow("Embedding API Key", self.embed_key_edit)
@@ -1752,6 +1785,7 @@ class SoullinkSettingsDialog(QDialog):
         form.addRow("TTS 模型", self.tts_model_edit)
         form.addRow("TTS 音色", self.voice_combo)
         form.addRow("动作风格", self.style_combo)
+        form.addRow("动作幅度（摇晃更明显）", self.intensity_spin)
         layout.addLayout(form)
 
         hint = QLabel(
@@ -1772,6 +1806,7 @@ class SoullinkSettingsDialog(QDialog):
     def values(self):
         return {
             "motion_style": self.style_combo.currentText(),
+            "motion_intensity": round(self.intensity_spin.value(), 1),
             "embedding": {
                 "base_url": self.embed_base_edit.text().strip().rstrip("/"),
                 "api_key": self.embed_key_edit.text().strip(),
@@ -2115,6 +2150,7 @@ class PetBridge(QObject):
 
 class PetWindow(QWidget):
     chat_reply = Signal(str)
+    chat_reply_quiet = Signal(str)
     soullink_event = Signal(str)
     soullink_js = Signal(str)
     soullink_status = Signal(str)
@@ -2160,6 +2196,7 @@ class PetWindow(QWidget):
         self.memory = pet_memory.PetMemory(self.memory_cfg, BASE_DIR)
         self.chat_mode = False
         self.chat_reply.connect(self._show_chat_reply)
+        self.chat_reply_quiet.connect(self._show_chat_reply_quiet)
         self.screen_cfg = load_screen_read_config()
         self.vision_client = VisionClient(self.screen_cfg.get("vision") or {})
         self.screen_timer = QTimer(self)
@@ -2225,7 +2262,6 @@ class PetWindow(QWidget):
         self.voice_tts_done = threading.Event()
         self._shot_result = None
         self._shot_event = threading.Event()
-        self._voice_chat_auto_soullink = False
         self.voice_play.connect(self._play_voice_file)
         self.voice_shot_requested.connect(self._on_voice_shot_requested)
         if self.voice_chat_cfg.get("enabled"):
@@ -2365,6 +2401,14 @@ class PetWindow(QWidget):
             "window.setVoiceInputEnabled("
             f"{str(bool(self.voice_cfg.get('enabled'))).lower()},"
             f"{json.dumps(self._ptt_label(), ensure_ascii=False)})"
+        )
+        self._run_js(
+            f"window.setMotionIntensity("
+            f"{float(self.soullink_cfg.get('motion_intensity', 1.0))})"
+        )
+        self._run_js(
+            f"window.setCropBottom("
+            f"{float(self.settings.get('crop_bottom', 0.0))})"
         )
         self._push_soullink_config()
 
@@ -2576,6 +2620,7 @@ class PetWindow(QWidget):
     def restore_defaults(self):
         self.settings = dict(DEFAULT_SETTINGS)
         save_settings(self.settings)
+        self._run_js("window.setCropBottom(0)")
         self.model_id = "yumi"
         self.model_cfg = load_model_config("yumi") or {}
         self.scale = 1.0
@@ -2687,10 +2732,14 @@ class PetWindow(QWidget):
                 intent = self.soullink_runner.classify(text)
             except Exception:
                 intent = None
-            if intent:
+            if intent and not self._is_error_reply(reply):
                 self.soullink_event.emit(
                     json.dumps(
-                        {"reply": reply, "intent": intent},
+                        {
+                            "reply": reply,
+                            "speak_text": self._tts_text(reply),
+                            "intent": intent,
+                        },
                         ensure_ascii=False,
                     )
                 )
@@ -2722,6 +2771,11 @@ class PetWindow(QWidget):
         self._run_js(
             f"window.showChatReply({json.dumps(reply)}, 6000)"
         )
+
+    def _show_chat_reply_quiet(self, reply):
+        """实时语音对话用：只做情绪表情反应，不显示文字气泡。"""
+        emotion = classify_emotion(reply)
+        self._run_js(f"window.chatReact({json.dumps(emotion)})")
 
     def set_chat_mode(self, enabled):
         self.chat_mode = bool(enabled)
@@ -2859,14 +2913,20 @@ class PetWindow(QWidget):
         save_proactive_config(self.proactive_cfg)
         if self.proactive_cfg.get("enabled"):
             self.last_proactive_ts = time.monotonic()
+            if not self.proactive_timer.isActive():
+                self.proactive_timer.start()
             self._notify(
                 f"主动发言设置已更新（平均约 {self.proactive_cfg.get('interval_minutes')} 分钟一次）"
             )
+        else:
+            self.proactive_timer.stop()
+            self._notify("主动发言已关闭")
 
     def _proactive_tick(self):
         if not self.proactive_cfg.get("enabled"):
             return
-        if self.proactive_busy or self.screen_read_busy or self.chat_mode:
+        # 不再受聊天模式限制：聊天框开着也照常主动发言
+        if self.proactive_busy or self.screen_read_busy:
             return
         now = time.monotonic()
         elapsed = now - self.last_proactive_ts
@@ -2923,23 +2983,42 @@ class PetWindow(QWidget):
         self._emit_speech(reply)
 
     def _emit_speech(self, reply):
-        """把一句台词交给 Soullink（带 TTS）或普通气泡显示。"""
+        """主动发言出口：TTS 朗读时不出气泡、不读括号；仅文本模式时显示气泡。"""
         reply = str(reply or "").strip()
         if not reply:
             return
+        tts_ok = bool(
+            self.voice_chat_cfg.get("tts_enabled")
+            and self._tts_client.ready()
+        )
         if self._soullink_usable():
             try:
                 intent = self.soullink_runner.classify(reply)
             except Exception:
                 intent = None
             if intent:
+                # Soullink 朗读：不出气泡，括号内容不读
                 self.soullink_event.emit(
                     json.dumps(
-                        {"reply": reply, "intent": intent},
+                        {
+                            "reply": reply,
+                            "speak_text": self._tts_text(reply),
+                            "intent": intent,
+                            "no_bubble": True,
+                        },
                         ensure_ascii=False,
                     )
                 )
                 return
+        if tts_ok:
+            # 独立 TTS 朗读：不出气泡，括号内容不读
+            try:
+                self._speak_voice(self._tts_text(reply))
+            except Exception:
+                # 朗读失败退回文本模式
+                self.chat_reply.emit(reply)
+            return
+        # 纯文本模式：显示气泡（保留原文）
         self.chat_reply.emit(reply)
 
     # ---------- 语音输入 ----------
@@ -3185,12 +3264,14 @@ class PetWindow(QWidget):
                 save_voice_chat_config(self.voice_chat_cfg)
                 self._notify("语音对话需要先配置聊天接口")
                 return
-            # 语音对话自动拉起 Soullink（表情驱动 + TTS 朗读）；关语音对话时若
-            # 是本功能自动开启的，则一并关闭
-            self._voice_chat_auto_soullink = False
+            # 语音对话自动拉起 Soullink（表情驱动 + TTS 朗读）。
+            # 关闭语音对话时不再连带关闭 Soullink：它是打字聊天的朗读底座，
+            # 自动关闭会导致 TTS 一起消失。
             if not self.soullink_cfg.get("enabled"):
-                self._voice_chat_auto_soullink = True
                 self.set_soullink_enabled(True)
+            elif not self.soullink_ready:
+                # 配置开着但侧车没起来，补一次启动
+                self._start_soullink_async()
             self.voice_chat_cfg["enabled"] = True
             save_voice_chat_config(self.voice_chat_cfg)
             self.voice_chat_stop = threading.Event()
@@ -3207,9 +3288,6 @@ class PetWindow(QWidget):
         save_voice_chat_config(self.voice_chat_cfg)
         self.voice_chat_stop.set()
         self.voice_chat_active = False
-        if self._voice_chat_auto_soullink:
-            self._voice_chat_auto_soullink = False
-            self.set_soullink_enabled(False)
         try:
             # 中断可能正阻塞在“等下一句”里的监听线程
             self.voice_recognizer.stop_continuous()
@@ -3249,6 +3327,18 @@ class PetWindow(QWidget):
             return ""
         rest = str(text)[idx + len(str(wake)) :].strip()
         return rest.strip("，。,.！!？?、 ")
+
+    @staticmethod
+    def _is_error_reply(reply):
+        """判断回复是否是错误提示（这类内容不朗读）。"""
+        return str(reply or "").startswith(VOICE_ERROR_PREFIXES)
+
+    @staticmethod
+    def _tts_text(reply):
+        """朗读文本：去掉所有括号里的内容（动作旁白、语气说明等），只读台词。"""
+        text = str(reply or "")
+        text = re.sub(r"[（(【\[][^（）()【】\[\]]*[）)】\]]", "", text)
+        return re.sub(r"\s+", " ", text).strip()
 
     def _voice_chat_loop(self):
         recognizer = self.voice_recognizer
@@ -3364,6 +3454,7 @@ class PetWindow(QWidget):
 
     def _voice_turn(self, text):
         """处理一句语音：可选读屏 + 聊天 + 记忆 + 气泡 + TTS 朗读。"""
+        _voice_chat_diag(f"turn text={text[:40]!r}")
         screen_desc = None
         user_content = text
         if (
@@ -3408,50 +3499,79 @@ class PetWindow(QWidget):
                 pass
         except Exception as exc:
             reply = f"（连接失败：{exc}）"
-        # 优先走 Soullink：表情驱动 + TTS 朗读（JS 播放结束回调后恢复麦克风）
+        # 优先走 Soullink：与打字聊天同一条已验证的朗读路径
+        # （表情驱动 + TTS；JS 播放结束回调后恢复麦克风）
         if (
             self._soullink_usable()
-            and self.soullink_classifier_ready
             and reply
-            and not reply.startswith("（")
+            and not self._is_error_reply(reply)
         ):
+            _voice_chat_diag("soullink branch: usable, classifying")
             try:
                 intent = self.soullink_runner.classify(text)
             except Exception:
                 intent = None
+                _voice_chat_diag("classify error -> fallback")
             if intent:
+                _voice_chat_diag("soullink branch: intent ok, emitting")
+                self.voice_status.emit("🔊 正在朗读…")
                 self.voice_recognizer.set_microphone(False)
                 try:
                     self.voice_tts_done.clear()
                     self.soullink_event.emit(
                         json.dumps(
-                            {"reply": reply, "intent": intent},
+                            {
+                                "reply": reply,
+                                "speak_text": self._tts_text(reply),
+                                "intent": intent,
+                                "no_bubble": True,
+                            },
                             ensure_ascii=False,
                         )
                     )
                     # 等 JS 朗读完再恢复收音，避免听到自己的声音
+                    waited_at = time.monotonic()
                     self.voice_tts_done.wait(timeout=60)
+                    _voice_chat_diag(
+                        "tts_played waited "
+                        f"{time.monotonic() - waited_at:.1f}s"
+                    )
                 finally:
                     self.voice_recognizer.set_microphone(True)
                 return
+            _voice_chat_diag("soullink branch: intent empty -> fallback")
+        else:
+            _voice_chat_diag(
+                "fallback: usable="
+                f"{self._soullink_usable()} reply={reply[:40]!r}"
+            )
         # 兜底：普通气泡 + 独立 TTS
-        self.chat_reply.emit(reply)
+        # 实时语音对话不出气泡，只做情绪表情
+        self.chat_reply_quiet.emit(reply)
         if (
             self.voice_chat_cfg.get("tts_enabled")
             and self._tts_client.ready()
             and reply
-            and not reply.startswith("（")
+            and not self._is_error_reply(reply)
         ):
+            _voice_chat_diag("fallback: standalone tts starting")
             self.voice_status.emit("🔊 正在朗读…")
             try:
                 # 朗读时暂停收音，避免桌宠“听到”自己的声音
                 self.voice_recognizer.set_microphone(False)
                 try:
-                    self._speak_voice(reply)
+                    self._speak_voice(self._tts_text(reply))
                 finally:
                     self.voice_recognizer.set_microphone(True)
             except Exception as exc:
                 self.voice_status.emit(f"TTS 失败：{exc}")
+                _voice_chat_diag(f"standalone tts error: {exc}")
+        else:
+            _voice_chat_diag(
+                "fallback skipped: tts_enabled="
+                f"{self.voice_chat_cfg.get('tts_enabled')} "
+                f"tts_ready={self._tts_client.ready()}"
+            )
 
     def _request_screen_shot(self):
         """请求界面线程截屏并等待结果（语音对话线程不能直接操作界面）。"""
@@ -3698,6 +3818,9 @@ class PetWindow(QWidget):
             "ttsUrl": f"http://127.0.0.1:{self.soullink_runner.port}/tts",
             "profileUrl": self._soullink_profile_url(),
             "motionStyle": self.soullink_cfg.get("motion_style", "natural"),
+            "motionIntensity": float(
+                self.soullink_cfg.get("motion_intensity", 1.0)
+            ),
         }
         self.soullink_js.emit(
             f"window.setSoullinkConfig({json.dumps(payload, ensure_ascii=False)})"
@@ -3775,6 +3898,11 @@ class PetWindow(QWidget):
         data["enabled"] = bool(self.soullink_cfg.get("enabled"))
         self.soullink_cfg.update(data)
         save_soullink_config(self.soullink_cfg)
+        # 动作幅度即时生效（内置引擎与 Soullink 共用）
+        self._run_js(
+            f"window.setMotionIntensity("
+            f"{float(self.soullink_cfg.get('motion_intensity', 1.0))})"
+        )
         if self.soullink_ready and self.soullink_runner and self.soullink_runner.ready:
             # 配置变更后重启侧服务使新模型/Key 生效
             self.soullink_runner.stop()
@@ -4182,6 +4310,42 @@ class PetWindow(QWidget):
             )
             lock_action.triggered.connect(self.toggle_lock)
             menu.addAction(lock_action)
+            menu.addSeparator()
+            crop_menu = _new_menu("裁切（从脚底往上）", menu)
+            menu.addMenu(crop_menu)
+            crop_action = QWidgetAction(crop_menu)
+            crop_widget = QWidget()
+            crop_layout = QVBoxLayout(crop_widget)
+            crop_layout.setContentsMargins(12, 6, 16, 6)
+            crop_label = QLabel()
+            crop_slider = QSlider(Qt.Horizontal)
+            crop_slider.setRange(0, 90)
+            crop_slider.setValue(
+                int(round(float(self.settings.get("crop_bottom", 0.0)) * 100))
+            )
+            crop_label.setText(f"裁切底部 {crop_slider.value()}%")
+            crop_label.setStyleSheet("color: #c4b5fd; font-size: 12px;")
+            crop_widget.setStyleSheet("background: transparent;")
+            crop_layout.addWidget(crop_label)
+            crop_layout.addWidget(crop_slider)
+            crop_action.setDefaultWidget(crop_widget)
+            crop_menu.addAction(crop_action)
+
+            def _apply_crop(_value):
+                pct = crop_slider.value()
+                crop_label.setText(f"裁切底部 {pct}%")
+                self.settings["crop_bottom"] = round(pct / 100.0, 2)
+                save_settings(self.settings)
+                self._run_js(f"window.setCropBottom({pct / 100.0})")
+
+            crop_slider.valueChanged.connect(_apply_crop)
+            crop_menu.addAction(
+                QAction(
+                    "重置裁切（0%）",
+                    self,
+                    triggered=lambda: crop_slider.setValue(0),
+                )
+            )
             menu.addSeparator()
             menu.addAction(QAction("放大", self, triggered=self.scale_up))
             menu.addAction(QAction("缩小", self, triggered=self.scale_down))

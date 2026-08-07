@@ -11,6 +11,13 @@ const chatInputEl = document.getElementById("chat-input");
 let bubbleTimer = null;
 let chatPanelH = 0;
 let chatReactTimer = null;
+let lastReactEmotion = null;
+let lastReactAt = 0;
+let motionIntensity = 1;
+let userCropBottom = 0;
+let idlePoseName = null;
+let idlePoseEndAt = 0;
+let nextIdlePoseAt = 0;
 let soullink = { enabled: false, config: null, bridge: null, starting: null };
 
 function soullinkEnabled() {
@@ -77,7 +84,10 @@ function exprKind(key) {
 // 单模型底部裁切比例（0-1），用于隐藏角色脚下额外画的内容（如水印文字）。
 function cropBottom() {
   return (
-    (modelConfig && modelConfig.crop && modelConfig.crop.bottom) || 0
+    Math.max(
+      (modelConfig && modelConfig.crop && modelConfig.crop.bottom) || 0,
+      userCropBottom
+    )
   );
 }
 
@@ -241,6 +251,7 @@ function applyMotion(dt) {
   if (motionActive === "preset" || motionActive === "none") return;
   motionClock += dt;
   const t = motionClock;
+  const mi = motionIntensity;
   if (motionActive === "wave") {
     setParam("ParamarmupR", 0);
     setParam("ParamBodyAngleY", 0);
@@ -275,8 +286,8 @@ function applyMotion(dt) {
     setParam("ParamarmupL", 0);
     setParam("ParamarmupR", 0.95 + 0.08 * Math.sin((t * Math.PI * 2) / 2.2));
     setParam("Paramanime", 0);
-    setParam("ParamAngleZ", 11 + 2.5 * Math.sin((t * Math.PI * 2) / 3.5));
-    setParam("ParamBodyAngleY", 3.2 * Math.sin((t * Math.PI * 2) / 4));
+    setParam("ParamAngleZ", 11 + 2.5 * mi * Math.sin((t * Math.PI * 2) / 3.5));
+    setParam("ParamBodyAngleY", 3.2 * mi * Math.sin((t * Math.PI * 2) / 4));
     setParam("ParamEyeBallY", 0.6 + 0.2 * Math.sin((t * Math.PI * 2) / 2.4));
     setParam("Paramdown1", 0);
   } else if (motionActive === "working") {
@@ -285,32 +296,35 @@ function applyMotion(dt) {
     setParam("ParamarmupR", 0);
     setParam("Paramanime", 0);
     setParam("Paramdown1", 0.8 + 0.1 * Math.sin((t * Math.PI * 2) / 1.1));
-    setParam("ParamAngleZ", 3.5 * Math.sin((t * Math.PI * 2) / 3.2));
-    setParam("ParamBodyAngleY", 2.6 * Math.sin((t * Math.PI * 2) / 0.9));
-    setParam("ParamAngleX", 2.5 * Math.sin((t * Math.PI * 2) / 1.3));
+    setParam("ParamAngleZ", 3.5 * mi * Math.sin((t * Math.PI * 2) / 3.2));
+    setParam("ParamBodyAngleY", 2.6 * mi * Math.sin((t * Math.PI * 2) / 0.9));
+    setParam("ParamAngleX", 2.5 * mi * Math.sin((t * Math.PI * 2) / 1.3));
   } else if (motionActive === "sad") {
     // Drooping shoulders, looking down a little.
     setParam("ParamarmupL", 0);
     setParam("ParamarmupR", 0);
     setParam("Paramanime", 0);
     setParam("Paramdown1", 0.72 + 0.08 * Math.sin((t * Math.PI * 2) / 3));
-    setParam("ParamAngleZ", 3.5 * Math.sin((t * Math.PI * 2) / 4));
-    setParam("ParamBodyAngleY", 1.6 * Math.sin((t * Math.PI * 2) / 3));
+    setParam("ParamAngleZ", 3.5 * mi * Math.sin((t * Math.PI * 2) / 4));
+    setParam("ParamBodyAngleY", 1.6 * mi * Math.sin((t * Math.PI * 2) / 3));
   } else if (motionActive === "angry") {
     // Slight trembling, one hand clenched near the chest.
     setParam("ParamarmupL", 0);
     setParam("ParamarmupR", 0.65 + 0.08 * Math.sin((t * Math.PI * 2) / 0.8));
     setParam("Paramanime", 0);
     setParam("Paramdown1", 0);
-    setParam("ParamAngleZ", 3.2 * Math.sin((t * Math.PI * 2) / 0.45));
-    setParam("ParamBodyAngleY", 4.2 * Math.sin((t * Math.PI * 2) / 0.6));
+    setParam("ParamAngleZ", 3.2 * mi * Math.sin((t * Math.PI * 2) / 0.45));
+    setParam("ParamBodyAngleY", 4.2 * mi * Math.sin((t * Math.PI * 2) / 0.6));
   } else if (motionActive === "surprised") {
     // Leaning back, head slightly tilted.
     setParam("ParamarmupL", 0);
     setParam("ParamarmupR", 0);
     setParam("Paramanime", 0);
     setParam("Paramdown1", 0);
-    setParam("ParamAngleZ", -6.5 + 1.5 * Math.sin((t * Math.PI * 2) / 1.2));
+    setParam(
+      "ParamAngleZ",
+      -6.5 + 1.5 * mi * Math.sin((t * Math.PI * 2) / 1.2)
+    );
     setParam("ParamAngleX", -7);
     setParam("ParamBodyAngleY", 0);
   } else if (motionActive === "nod") {
@@ -319,15 +333,16 @@ function applyMotion(dt) {
     setParam("ParamarmupR", 0);
     setParam("Paramanime", 0);
     setParam("Paramdown1", 0.22 + 0.06 * Math.sin((t * Math.PI * 2) / 3.2));
-    setParam("ParamAngleZ", 1.5 * Math.sin((t * Math.PI * 2) / 4));
-    setParam("ParamBodyAngleY", 0.8 * Math.sin((t * Math.PI * 2) / 3.2));
+    setParam("ParamAngleZ", 1.5 * mi * Math.sin((t * Math.PI * 2) / 4));
+    setParam("ParamBodyAngleY", 0.8 * mi * Math.sin((t * Math.PI * 2) / 3.2));
   } else {
+    // 待机：明显的左右摇晃（身体 + 头部），幅度随动作强度设置放大。
     setParam("ParamarmupL", 0);
     setParam("ParamarmupR", 0);
     setParam("Paramanime", 0);
-    setParam("ParamAngleZ", 4.5 * Math.sin((t * Math.PI * 2) / 7));
-    setParam("ParamAngleX", 3.5 * Math.sin((t * Math.PI * 2) / 9 + 1));
-    setParam("ParamBodyAngleY", 0);
+    setParam("ParamAngleZ", 6.0 * mi * Math.sin((t * Math.PI * 2) / 5));
+    setParam("ParamAngleX", 4.0 * mi * Math.sin((t * Math.PI * 2) / 7 + 1));
+    setParam("ParamBodyAngleY", 3.5 * mi * Math.sin((t * Math.PI * 2) / 4.5));
     setParam("Paramdown1", 0);
   }
 }
@@ -341,7 +356,9 @@ function applyTransition(dt) {
   const k = Math.sin(transitionT * Math.PI);
   const sway = Math.sin(transitionT * Math.PI * 2) * k;
   const amp =
-    currentState === "completed" || currentState === "chat-happy" ? 1.4 : 0.8;
+    (currentState === "completed" || currentState === "chat-happy"
+      ? 1.4
+      : 0.8) * motionIntensity;
   setParam("ParamAngleZ", g("ParamAngleZ") + sway * 2.5 * amp);
   setParam("ParamBodyAngleY", g("ParamBodyAngleY") + k * 1.2 * amp);
   setParam("Paramdown1", g("Paramdown1") + k * 0.08 * amp);
@@ -389,7 +406,6 @@ function stopMotion() {
 
 function chatReact(emotion) {
   if (soullinkEnabled()) return;
-  if (chatReactTimer) clearTimeout(chatReactTimer);
   const prevState = currentState;
   const generic = {
     happy: { face: "heart" },
@@ -419,10 +435,16 @@ function chatReact(emotion) {
   manualMotion = null;
   motionClock = 0;
   transitionT = 0;
-  chatReactTimer = setTimeout(() => {
-    currentState = prevState;
-    applyStateVisuals(prevState);
-  }, 8000);
+  // 反应有硬上限：连续对话也不会一直不还原（尤其是黑脸）。
+  // 计时器已在计时时不再重置，保证一轮连发后必定还原。
+  if (!chatReactTimer) {
+    const duration = emotion === "angry" ? 4000 : 8000;
+    chatReactTimer = setTimeout(() => {
+      chatReactTimer = null;
+      currentState = prevState;
+      applyStateVisuals(prevState);
+    }, duration);
+  }
 }
 
 function showBubble(text, ms) {
@@ -486,6 +508,9 @@ async function stopSoullink() {
 
 window.setSoullinkConfig = async (cfg) => {
   soullink.config = cfg;
+  if (cfg && typeof cfg.motionIntensity === "number") {
+    window.setMotionIntensity(cfg.motionIntensity);
+  }
   if (!cfg || !cfg.enabled) {
     await stopSoullink();
     return;
@@ -495,7 +520,8 @@ window.setSoullinkConfig = async (cfg) => {
     await bridge.start({
       profileUrl: cfg.profileUrl,
       ttsUrl: cfg.ttsUrl,
-      motionStyle: cfg.motionStyle || "natural"
+      motionStyle: cfg.motionStyle || "natural",
+      bodyMotionGain: 2.8 * motionIntensity
     });
     soullink.enabled = true;
     if (model) bridge.setModel(model);
@@ -524,17 +550,37 @@ window.soullinkChat = (payload) => {
     return;
   }
   const intent = payload.intent || null;
-  if (payload.reply) showChatReply(payload.reply, 6000);
+  // 实时语音对话（no_bubble）不显示文字气泡，其余照常显示
+  if (payload.reply && !payload.no_bubble) showChatReply(payload.reply, 6000);
   if (intent) {
-    soullink.bridge.react(intent);
-    Promise.resolve(
-      soullink.bridge.speak({
-        text: payload.reply || "",
+    // 有情绪反应/说话时，让 SDK 表情接管，取消待机姿势及其恢复计时
+    idlePoseName = null;
+    idlePoseEndAt = 0;
+    nextIdlePoseAt =
+      (performance.now ? performance.now() / 1000 : Date.now() / 1000) + 30;
+    // 同一情绪在短时间内重复触发时跳过表情反应（避免连续“生气”导致黑脸不还原），
+    // TTS 朗读不受影响。
+    const emotionKey =
+      intent.naturalEmotion || intent.emotion || "neutral";
+    const now = Date.now();
+    const repeat = emotionKey === lastReactEmotion && now - lastReactAt < 2500;
+    if (!repeat) {
+      lastReactEmotion = emotionKey;
+      lastReactAt = now;
+      soullink.bridge.react(intent);
+    }
+    let speakPromise;
+    try {
+      speakPromise = soullink.bridge.speak({
+        text: payload.speak_text || payload.reply || "",
         emotion: intent.naturalEmotion || intent.emotion,
         vad: intent.naturalVAD,
         intent
-      })
-    ).finally(() => {
+      });
+    } catch (err) {
+      speakPromise = Promise.resolve();
+    }
+    Promise.resolve(speakPromise).finally(() => {
       // 朗读结束（无论成败）通知 Python，用于语音对话期间恢复麦克风
       if (window.__bridge && window.__bridge.tts_played) {
         window.__bridge.tts_played();
@@ -711,6 +757,31 @@ function onFrame(ts) {
     model.update(dt);
     // Soullink 模式：身体/表情由 SDK 情绪引擎驱动，这里只补回鼠标追踪
     // （眼神全量跟随，头部/身体减半幅度，避免完全盖掉情绪姿态）。
+    // 待机小动作：长时间没互动时随机做扶脸/看手机/记笔记/前倾等姿势。
+    if (!idlePoseName && t >= nextIdlePoseAt && model.expression) {
+      const poses = ["hand", "phone", "notes", "lean"].filter(
+        (name) => EXPR_DATA[name]
+      );
+      if (poses.length && Math.random() < 0.7) {
+        idlePoseName = poses[Math.floor(Math.random() * poses.length)];
+        idlePoseEndAt = t + 4 + Math.random() * 3;
+        try {
+          model.expression(idlePoseName);
+        } catch (e) {
+          idlePoseName = null;
+        }
+      }
+      nextIdlePoseAt = t + 25 + Math.random() * 20;
+    }
+    if (idlePoseName && t >= idlePoseEndAt) {
+      try {
+        const em =
+          model.internalModel && model.internalModel.expressionManager;
+        if (em && em.stopAllExpressions) em.stopAllExpressions();
+      } catch (e) {}
+      idlePoseName = null;
+      nextIdlePoseAt = t + 25 + Math.random() * 20;
+    }
     setParam("ParamEyeBallX", eyeX);
     setParam("ParamEyeBallY", -eyeY * 0.9);
     setParam("ParamAngleX", eyeX * 11);
@@ -832,6 +903,22 @@ window.notify = showBubble;
 window.setChatMode = setChatMode;
 window.showChatReply = showChatReply;
 window.chatReact = chatReact;
+
+// 动作幅度（0.5x - 2x）：内置动作引擎的摇晃/姿态统一按此放大。
+window.setMotionIntensity = (v) => {
+  const n = Number(v);
+  motionIntensity = Number.isFinite(n) ? Math.min(2, Math.max(0.5, n)) : 1;
+};
+
+// 从脚底往上裁切（百分比 0-95），裁掉的底部留在窗口外。
+window.setCropBottom = (v) => {
+  const n = Number(v);
+  userCropBottom = Number.isFinite(n) ? Math.min(0.95, Math.max(0, n)) : 0;
+  if (model) {
+    fitModel();
+    reportBounds();
+  }
+};
 window.setScale = setScale;
 
 const chatMicEl = document.getElementById("chat-mic");

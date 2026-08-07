@@ -3,5 +3,6 @@
   "pos_x": null,
   "pos_y": null,
   "locked": true,
-  "model": "yumi"
+  "model": "yumi",
+  "crop_bottom": 0.0
 }

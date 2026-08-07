@@ -63,6 +63,7 @@
   "soullink": {
     "enabled": false,
     "motion_style": "natural",
+    "motion_intensity": 1.0,
     "embedding": {
       "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
       "api_key": "",

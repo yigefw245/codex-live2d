@@ -47,6 +47,10 @@ const generator = new Live2DProfileAutoGenerator({
 // 这里把同一张脸的其他等价情绪别名也补进 expressionMap，让情绪反应覆盖更全。
 // 只有 catalog 里真实存在的表情名才会被引用。
 const EXPRESSION_ALIASES = [
+  // 手部动作姿势优先：好奇/疑惑时扶脸思考，累的时候看手机
+  // （catalog 里存在才会生效；顺序在脸部别名之前，避免被星星眼等先占位）
+  { name: "hand", emotions: ["curious", "confused"] },
+  { name: "phone", emotions: ["tired"] },
   { name: "happy", emotions: ["affectionate"] },
   { name: "star", emotions: ["curious"] },
   { name: "tear", emotions: ["teary", "anxiety", "tired", "concerned"] },
