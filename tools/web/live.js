@@ -527,11 +527,18 @@ window.soullinkChat = (payload) => {
   if (payload.reply) showChatReply(payload.reply, 6000);
   if (intent) {
     soullink.bridge.react(intent);
-    soullink.bridge.speak({
-      text: payload.reply || "",
-      emotion: intent.naturalEmotion || intent.emotion,
-      vad: intent.naturalVAD,
-      intent
+    Promise.resolve(
+      soullink.bridge.speak({
+        text: payload.reply || "",
+        emotion: intent.naturalEmotion || intent.emotion,
+        vad: intent.naturalVAD,
+        intent
+      })
+    ).finally(() => {
+      // 朗读结束（无论成败）通知 Python，用于语音对话期间恢复麦克风
+      if (window.__bridge && window.__bridge.tts_played) {
+        window.__bridge.tts_played();
+      }
     });
   }
 };

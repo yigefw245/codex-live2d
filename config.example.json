@@ -20,6 +20,36 @@
     "hotkey_key": "F8",
     "hotkey_modifiers": ""
   },
+  "voice_chat": {
+    "enabled": false,
+    "wake_words": ["yumi", "尤米"],
+    "silence_seconds": 0.8,
+    "idle_timeout_seconds": 60,
+    "max_turns": 50,
+    "exit_phrases": ["退出对话", "拜拜", "再见", "不聊了", "去忙吧"],
+    "tts_enabled": true,
+    "tts": {
+      "base_url": "https://dashscope.aliyuncs.com/api/v1",
+      "api_key": "",
+      "model": "qwen-tts",
+      "voice": "Cherry",
+      "language_type": "Chinese"
+    }
+  },
+  "memory": {
+    "enabled": true,
+    "short_term_max_messages": 40,
+    "short_term_max_hours": 24,
+    "long_term_extract": true,
+    "long_term_max_entries": 200,
+    "recall_top_k": 5,
+    "use_embedding": true,
+    "embedding": {
+      "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "api_key": "",
+      "model": "text-embedding-v3"
+    }
+  },
   "screen_read": {
     "enabled": false,
     "interval_minutes": 10,

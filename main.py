@@ -7,6 +7,7 @@ import random
 import re
 import shutil
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -22,6 +23,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QLabel,
@@ -39,6 +41,7 @@ from PySide6.QtWebEngineCore import QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
 import codex_monitor
+import pet_memory
 import soullink_runner
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -416,6 +419,26 @@ SCREEN_READ_DEFAULTS = {
     "vision": dict(VISION_DEFAULTS),
 }
 
+# 聊天里说“帮我看看”之类的话时，自动读屏幕并把画面内容一起交给模型
+SCREEN_LOOK_KEYWORDS = (
+    "屏幕",
+    "看屏幕",
+    "看看屏幕",
+    "看一下屏幕",
+    "看桌面",
+    "看看桌面",
+    "帮我看看",
+    "帮我看",
+    "帮我瞅瞅",
+    "帮我瞧瞧",
+    "看看我",
+    "看看我在",
+    "你能看到",
+    "你在看什么",
+    "瞅一眼",
+    "瞄一眼",
+)
+
 
 SOULLINK_DEFAULTS = {
     "enabled": False,
@@ -451,6 +474,38 @@ VOICE_INPUT_DEFAULTS = {
     "hotkey_enabled": True,
     "hotkey_key": "F8",
     "hotkey_modifiers": "",
+}
+
+VOICE_CHAT_DEFAULTS = {
+    "enabled": False,
+    "wake_words": ["yumi", "尤米"],
+    "silence_seconds": 0.8,
+    "idle_timeout_seconds": 60,
+    "max_turns": 50,
+    "exit_phrases": ["退出对话", "拜拜", "再见", "不聊了", "去忙吧"],
+    "tts_enabled": True,
+    "tts": {
+        "base_url": "https://dashscope.aliyuncs.com/api/v1",
+        "api_key": "",
+        "model": "qwen-tts",
+        "voice": "Cherry",
+        "language_type": "Chinese",
+    },
+}
+
+MEMORY_DEFAULTS = {
+    "enabled": True,
+    "short_term_max_messages": 40,
+    "short_term_max_hours": 24,
+    "long_term_extract": True,
+    "long_term_max_entries": 200,
+    "recall_top_k": 5,
+    "use_embedding": True,
+    "embedding": {
+        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "api_key": "",
+        "model": "text-embedding-v3",
+    },
 }
 
 STT_CACHE_ROOT = os.path.join(BASE_DIR, ".cache", "stt")
@@ -771,6 +826,166 @@ def save_voice_input_config(cfg):
         json.dump(root, f, ensure_ascii=False, indent=2)
 
 
+def load_voice_chat_config():
+    """读取语音对话配置：唤醒词、监听时长、退出语与 TTS 接口。"""
+    cfg = {
+        "enabled": VOICE_CHAT_DEFAULTS["enabled"],
+        "wake_words": list(VOICE_CHAT_DEFAULTS["wake_words"]),
+        "silence_seconds": VOICE_CHAT_DEFAULTS["silence_seconds"],
+        "idle_timeout_seconds": VOICE_CHAT_DEFAULTS["idle_timeout_seconds"],
+        "max_turns": VOICE_CHAT_DEFAULTS["max_turns"],
+        "exit_phrases": list(VOICE_CHAT_DEFAULTS["exit_phrases"]),
+        "tts_enabled": VOICE_CHAT_DEFAULTS["tts_enabled"],
+        "tts": dict(VOICE_CHAT_DEFAULTS["tts"]),
+    }
+    try:
+        with open(os.path.join(BASE_DIR, "config.json"), encoding="utf-8") as f:
+            root = json.load(f)
+            saved = (root.get("voice_chat") or {})
+        if isinstance(saved.get("enabled"), bool):
+            cfg["enabled"] = saved["enabled"]
+        if isinstance(saved.get("tts_enabled"), bool):
+            cfg["tts_enabled"] = saved["tts_enabled"]
+        try:
+            cfg["silence_seconds"] = max(
+                0.3, float(saved.get("silence_seconds", cfg["silence_seconds"]))
+            )
+        except (TypeError, ValueError):
+            pass
+        for key in ("idle_timeout_seconds", "max_turns"):
+            try:
+                cfg[key] = max(1, int(saved.get(key, cfg[key])))
+            except (TypeError, ValueError):
+                pass
+        for key in ("wake_words", "exit_phrases"):
+            value = saved.get(key)
+            if isinstance(value, str) and value.strip():
+                cfg[key] = [
+                    part.strip()
+                    for part in re.split(r"[、,，/|]", value)
+                    if part.strip()
+                ]
+            elif isinstance(value, list):
+                cfg[key] = [
+                    str(part).strip()
+                    for part in value
+                    if str(part).strip()
+                ]
+        tts = saved.get("tts") or {}
+        for key in ("base_url", "api_key", "model", "voice", "language_type"):
+            if isinstance(tts.get(key), str) and tts[key].strip():
+                cfg["tts"][key] = tts[key].strip()
+        # 复用已有百炼 TTS Key（Soullink TTS），省去重复填写
+        soullink_tts = (root.get("soullink") or {}).get("tts") or {}
+        if not cfg["tts"].get("api_key"):
+            key = soullink_tts.get("api_key")
+            if isinstance(key, str) and key.strip():
+                cfg["tts"]["api_key"] = key.strip()
+    except Exception:
+        pass
+    env_data = _dashscope_env()
+    dashscope_key = os.environ.get("DASHSCOPE_API_KEY", "") or env_data.get(
+        "DASHSCOPE_API_KEY", ""
+    )
+    if not cfg["tts"].get("api_key") and dashscope_key:
+        cfg["tts"]["api_key"] = dashscope_key
+    return cfg
+
+
+def save_voice_chat_config(cfg):
+    config_path = os.path.join(BASE_DIR, "config.json")
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            root = json.load(f)
+    except Exception:
+        root = {}
+    root["voice_chat"] = cfg
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(root, f, ensure_ascii=False, indent=2)
+
+
+def load_memory_config():
+    """读取本地记忆配置：短期/长期记忆参数 + Embedding 语义检索接口。"""
+    cfg = {
+        "enabled": MEMORY_DEFAULTS["enabled"],
+        "short_term_max_messages": MEMORY_DEFAULTS["short_term_max_messages"],
+        "short_term_max_hours": MEMORY_DEFAULTS["short_term_max_hours"],
+        "long_term_extract": MEMORY_DEFAULTS["long_term_extract"],
+        "long_term_max_entries": MEMORY_DEFAULTS["long_term_max_entries"],
+        "recall_top_k": MEMORY_DEFAULTS["recall_top_k"],
+        "use_embedding": MEMORY_DEFAULTS["use_embedding"],
+        "embedding": dict(MEMORY_DEFAULTS["embedding"]),
+    }
+    try:
+        with open(os.path.join(BASE_DIR, "config.json"), encoding="utf-8") as f:
+            root = json.load(f)
+            saved = (root.get("memory") or {})
+        if isinstance(saved.get("enabled"), bool):
+            cfg["enabled"] = saved["enabled"]
+        if isinstance(saved.get("long_term_extract"), bool):
+            cfg["long_term_extract"] = saved["long_term_extract"]
+        if isinstance(saved.get("use_embedding"), bool):
+            cfg["use_embedding"] = saved["use_embedding"]
+        for key in (
+            "short_term_max_messages",
+            "long_term_max_entries",
+            "recall_top_k",
+        ):
+            try:
+                cfg[key] = max(1, int(saved.get(key, cfg[key])))
+            except (TypeError, ValueError):
+                pass
+        try:
+            cfg["short_term_max_hours"] = max(
+                0.5,
+                float(
+                    saved.get(
+                        "short_term_max_hours",
+                        cfg["short_term_max_hours"],
+                    )
+                ),
+            )
+        except (TypeError, ValueError):
+            pass
+        embedding = saved.get("embedding") or {}
+        for key in ("base_url", "api_key", "model"):
+            if isinstance(embedding.get(key), str) and embedding[key].strip():
+                cfg["embedding"][key] = embedding[key].strip()
+        if not cfg["embedding"].get("api_key"):
+            # 复用已有百炼 Key（Soullink Embedding / 读屏幕视觉），省去重复填写
+            for section in ("soullink", "screen_read"):
+                part = root.get(section) or {}
+                if section == "soullink":
+                    part = part.get("embedding") or {}
+                elif section == "screen_read":
+                    part = part.get("vision") or {}
+                key = part.get("api_key") if isinstance(part, dict) else None
+                if isinstance(key, str) and key.strip():
+                    cfg["embedding"]["api_key"] = key.strip()
+                    break
+    except Exception:
+        pass
+    env_data = _dashscope_env()
+    dashscope_key = os.environ.get("DASHSCOPE_API_KEY", "") or env_data.get(
+        "DASHSCOPE_API_KEY", ""
+    )
+    if not cfg["embedding"].get("api_key") and dashscope_key:
+        cfg["embedding"]["api_key"] = dashscope_key
+    return cfg
+
+
+def save_memory_config(cfg):
+    config_path = os.path.join(BASE_DIR, "config.json")
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            root = json.load(f)
+    except Exception:
+        root = {}
+    root["memory"] = cfg
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(root, f, ensure_ascii=False, indent=2)
+
+
 EMOTION_KEYWORDS = {
     "happy": [
         "哈哈", "开心", "高兴", "太好了", "真棒", "爱你", "耶", "可爱",
@@ -818,14 +1033,20 @@ class ChatClient:
     def ready(self):
         return bool(self.key and self.base)
 
-    def chat(self, history, text, timeout=60):
+    def chat(self, history, text, memory_note=None, timeout=60):
         messages = [{"role": "system", "content": self.persona}]
+        if memory_note:
+            messages.append({"role": "system", "content": memory_note})
         messages.extend(history[-20:])
         messages.append({"role": "user", "content": text})
+        return self.raw_complete(messages, max_tokens=300, timeout=timeout)
+
+    def raw_complete(self, messages, max_tokens=300, timeout=60):
+        """直接发送一组消息并返回模型文本（记忆提炼等内部调用使用）。"""
         body = {
             "model": self.model,
             "messages": messages,
-            "max_tokens": 300,
+            "max_tokens": max_tokens,
         }
         request = urllib.request.Request(
             self.base + "/chat/completions",
@@ -887,6 +1108,53 @@ class VisionClient:
         return str(data["choices"][0]["message"]["content"]).strip()
 
 
+class TtsClient:
+    """DashScope（百炼）TTS 客户端：合成文本并下载音频，供语音对话朗读。"""
+
+    def __init__(self, cfg):
+        cfg = cfg or {}
+        self.base = str(
+            cfg.get("base_url") or VOICE_CHAT_DEFAULTS["tts"]["base_url"]
+        ).rstrip("/")
+        self.key = str(cfg.get("api_key") or "")
+        self.model = str(cfg.get("model") or "qwen-tts")
+        self.voice = str(cfg.get("voice") or "Cherry")
+        self.language_type = str(cfg.get("language_type") or "Chinese")
+
+    def ready(self):
+        return bool(self.key and self.base and self.model)
+
+    def synthesize(self, text, timeout=120):
+        """合成并下载音频，返回 (audio_bytes, mime)。"""
+        body = {
+            "model": self.model,
+            "input": {
+                "text": str(text),
+                "voice": self.voice,
+                "language_type": self.language_type,
+            },
+        }
+        request = urllib.request.Request(
+            self.base + "/services/aigc/multimodal-generation/generation",
+            data=json.dumps(body).encode("utf-8"),
+            headers={
+                "Authorization": "Bearer " + self.key,
+                "Content-Type": "application/json",
+            },
+        )
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        audio_url = (data.get("output") or {}).get("audio", {}).get("url")
+        if not audio_url:
+            raise RuntimeError("TTS 响应中没有音频地址")
+        with urllib.request.urlopen(audio_url, timeout=timeout) as response:
+            audio = response.read()
+        mime = (
+            response.headers.get("content-type") or "audio/wav"
+        ).split(";")[0].strip()
+        return audio, mime
+
+
 class LocalVoiceRecognizer:
     """本地语音识别：RealtimeSTT + faster-whisper，录音和识别都在本机完成。"""
 
@@ -895,6 +1163,7 @@ class LocalVoiceRecognizer:
         self.model = str(cfg.get("model") or VOICE_INPUT_DEFAULTS["model"])
         self.language = str(cfg.get("language") or VOICE_INPUT_DEFAULTS["language"])
         self.hf_endpoint = str(cfg.get("hf_endpoint") or "").strip()
+        self.silence_duration = 0.8
         self._recorder = None
         self._ready = False
         self._recording = False
@@ -902,6 +1171,7 @@ class LocalVoiceRecognizer:
         self._lock = threading.Lock()
         self._cancel = threading.Event()
         self._progress_cb = None
+        self._continuous = False
 
     def ready(self):
         return self._ready
@@ -1075,6 +1345,9 @@ class LocalVoiceRecognizer:
             ensure_sentence_starting_uppercase=False,
             ensure_sentence_ends_with_period=False,
             use_microphone=True,
+            post_speech_silence_duration=max(
+                0.3, float(self.silence_duration)
+            ),
         )
 
     def start(self):
@@ -1106,6 +1379,7 @@ class LocalVoiceRecognizer:
             recorder = self._recorder
             try:
                 recorder.start()
+                recorder.set_microphone(True)
             except Exception as exc:
                 self._error = f"麦克风启动失败：{exc}"
                 return False
@@ -1144,9 +1418,122 @@ class LocalVoiceRecognizer:
             self._recorder = None
             self._ready = False
             self._recording = False
+            self._continuous = False
         if recorder is not None:
             try:
                 recorder.shutdown()
+            except Exception:
+                pass
+
+    # ---------- 连续监听（VAD 静音自动断句） ----------
+
+    def start_continuous(self):
+        """确保录音器就绪并进入连续监听状态。
+
+        不手动开始录音：首次调用 recognize_utterance() 时库会自动武装
+        VAD 循环，之后每说完一句（静音断句）就返回一句识别文本。
+        """
+        with self._lock:
+            need_create = self._recorder is None
+        if need_create:
+            try:
+                recorder = self._create()
+            except Exception as exc:
+                self._error = f"语音模型加载失败：{exc}"
+                return False
+            with self._lock:
+                if self._recorder is not None:
+                    try:
+                        recorder.shutdown()
+                    except Exception:
+                        pass
+                    return False
+                self._recorder = recorder
+                self._ready = True
+                self._error = ""
+        with self._lock:
+            recorder = self._recorder
+        if recorder is not None:
+            try:
+                recorder.set_microphone(True)
+            except Exception:
+                pass
+        self._continuous = True
+        return True
+
+    def recognize_utterance(self, timeout=None, cancel=None):
+        """等待下一句（VAD 静音断句）并返回识别文本。
+
+        等待期间不打断录音（说话不会被切片切碎）。
+        - timeout：最多等多少秒，超时中断并返回 None（通常表示空闲超时）；
+        - cancel：可选的停止事件，置位时立即中断并返回 None；
+        - 识别出错返回空字符串。
+        """
+        with self._lock:
+            recorder = self._recorder
+        if recorder is None:
+            return ""
+
+        # 等待上一个等待线程完全退出，避免并发调用 text()
+        prev = getattr(self, "_utterance_worker", None)
+        if prev is not None and prev.is_alive():
+            prev.join(timeout=3.0)
+
+        result = {}
+        done = threading.Event()
+
+        def _work():
+            try:
+                result["text"] = str(recorder.text() or "").strip()
+            except Exception as exc:
+                result["error"] = str(exc)
+            finally:
+                done.set()
+
+        def _abort():
+            try:
+                recorder.abort()
+            except Exception:
+                pass
+
+        worker = threading.Thread(target=_work, daemon=True)
+        self._utterance_worker = worker
+        worker.start()
+        started = time.monotonic()
+        while True:
+            if cancel is not None and cancel.is_set():
+                threading.Thread(target=_abort, daemon=True).start()
+                worker.join(timeout=1.0)
+                return None
+            if timeout is not None and time.monotonic() - started >= timeout:
+                threading.Thread(target=_abort, daemon=True).start()
+                worker.join(timeout=1.0)
+                return None
+            if done.wait(0.2):
+                break
+        if result.get("error"):
+            self._error = f"语音识别失败：{result['error']}"
+            return ""
+        return result.get("text", "")
+
+    def set_microphone(self, enabled):
+        """暂停/恢复收音（TTS 朗读期间静音，避免自听自说）。"""
+        with self._lock:
+            recorder = self._recorder
+        if recorder is not None:
+            try:
+                recorder.set_microphone(bool(enabled))
+            except Exception:
+                pass
+
+    def stop_continuous(self):
+        with self._lock:
+            recorder = self._recorder
+            self._continuous = False
+            self._recording = False
+        if recorder is not None:
+            try:
+                recorder.set_microphone(False)
             except Exception:
                 pass
 
@@ -1185,6 +1572,81 @@ class ChatSettingsDialog(QDialog):
             "api_key": self.api_key_edit.text().strip(),
             "model": self.model_edit.text().strip(),
             "persona": self.persona_edit.toPlainText().strip(),
+        }
+
+
+class MemorySettingsDialog(QDialog):
+    """记忆设置：开关 + 短期/长期记忆参数 + 语义检索接口。"""
+
+    def __init__(self, cfg, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("记忆设置")
+        self.setModal(True)
+        self.setMinimumWidth(460)
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.enabled_check = QCheckBox("开启记忆（重启后保留）")
+        self.enabled_check.setChecked(bool(cfg.get("enabled", True)))
+        self.short_max_spin = QSpinBox()
+        self.short_max_spin.setRange(5, 500)
+        self.short_max_spin.setValue(int(cfg.get("short_term_max_messages", 40)))
+        self.short_hours_spin = QSpinBox()
+        self.short_hours_spin.setRange(1, 720)
+        self.short_hours_spin.setValue(int(cfg.get("short_term_max_hours", 24)))
+        self.extract_check = QCheckBox("对话后自动提炼长期记忆")
+        self.extract_check.setChecked(bool(cfg.get("long_term_extract", True)))
+        self.long_max_spin = QSpinBox()
+        self.long_max_spin.setRange(20, 2000)
+        self.long_max_spin.setValue(int(cfg.get("long_term_max_entries", 200)))
+        self.use_emb_check = QCheckBox("用 Embedding 语义检索记忆（推荐）")
+        self.use_emb_check.setChecked(bool(cfg.get("use_embedding", True)))
+
+        form.addRow("记忆开关", self.enabled_check)
+        form.addRow("短期记忆保留条数", self.short_max_spin)
+        form.addRow("短期记忆保留时长（小时）", self.short_hours_spin)
+        form.addRow("长期记忆提炼", self.extract_check)
+        form.addRow("长期记忆上限（条）", self.long_max_spin)
+        form.addRow("语义检索", self.use_emb_check)
+
+        embedding = cfg.get("embedding") or {}
+        self.embed_base_edit = QLineEdit(str(embedding.get("base_url", "")))
+        self.embed_key_edit = QLineEdit(str(embedding.get("api_key", "")))
+        self.embed_key_edit.setEchoMode(QLineEdit.Password)
+        self.embed_model_edit = QLineEdit(str(embedding.get("model", "")))
+        form.addRow("Embedding API 地址", self.embed_base_edit)
+        form.addRow("Embedding API Key", self.embed_key_edit)
+        form.addRow("Embedding 模型", self.embed_model_edit)
+        layout.addLayout(form)
+
+        hint = QLabel(
+            "短期记忆：保存最近几小时内的对话，重启后自动恢复。\n"
+            "长期记忆：每轮对话后自动提炼重要事实（如你的名字、喜好、约定），"
+            "回复前按相关度召回。未配置 Embedding Key 时自动改用关键词匹配。"
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #888;")
+        layout.addWidget(hint)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def values(self):
+        return {
+            "enabled": self.enabled_check.isChecked(),
+            "short_term_max_messages": self.short_max_spin.value(),
+            "short_term_max_hours": self.short_hours_spin.value(),
+            "long_term_extract": self.extract_check.isChecked(),
+            "long_term_max_entries": self.long_max_spin.value(),
+            "use_embedding": self.use_emb_check.isChecked(),
+            "embedding": {
+                "base_url": self.embed_base_edit.text().strip().rstrip("/"),
+                "api_key": self.embed_key_edit.text().strip(),
+                "model": self.embed_model_edit.text().strip(),
+            },
         }
 
 
@@ -1500,6 +1962,112 @@ class VoiceInputSettingsDialog(QDialog):
         }
 
 
+class VoiceChatSettingsDialog(QDialog):
+    """语音对话设置：唤醒词、监听时长、退出语与 TTS 接口。"""
+
+    def __init__(self, cfg, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("语音对话设置")
+        self.setModal(True)
+        self.setMinimumWidth(480)
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.enabled_check = QCheckBox("开启语音对话（免按键）")
+        self.enabled_check.setChecked(bool(cfg.get("enabled", False)))
+        self.wake_edit = QLineEdit(
+            "、".join(str(w) for w in (cfg.get("wake_words") or ["yumi"]))
+        )
+        self.exit_edit = QLineEdit(
+            "、".join(str(p) for p in (cfg.get("exit_phrases") or []))
+        )
+        self.silence_spin = QDoubleSpinBox()
+        self.silence_spin.setRange(0.3, 2.0)
+        self.silence_spin.setSingleStep(0.1)
+        self.silence_spin.setDecimals(1)
+        self.silence_spin.setValue(float(cfg.get("silence_seconds", 0.8)))
+        self.silence_spin.setSuffix(" 秒")
+        self.idle_spin = QSpinBox()
+        self.idle_spin.setRange(10, 600)
+        self.idle_spin.setValue(int(cfg.get("idle_timeout_seconds", 60)))
+        self.idle_spin.setSuffix(" 秒")
+        self.turns_spin = QSpinBox()
+        self.turns_spin.setRange(5, 200)
+        self.turns_spin.setValue(int(cfg.get("max_turns", 50)))
+        self.turns_spin.setSuffix(" 轮")
+
+        form.addRow("开启语音对话", self.enabled_check)
+        form.addRow("唤醒词（多个用顿号隔开）", self.wake_edit)
+        form.addRow("静音多久算说完一句", self.silence_spin)
+        form.addRow("空闲多久回到待唤醒", self.idle_spin)
+        form.addRow("单次对话最多轮数", self.turns_spin)
+        form.addRow("退出语（多个用顿号隔开）", self.exit_edit)
+        layout.addLayout(form)
+
+        self.tts_check = QCheckBox("用 TTS 朗读回复")
+        self.tts_check.setChecked(bool(cfg.get("tts_enabled", True)))
+        form.addRow("语音回复", self.tts_check)
+
+        tts = cfg.get("tts") or {}
+        self.tts_base_edit = QLineEdit(str(tts.get("base_url", "")))
+        self.tts_key_edit = QLineEdit(str(tts.get("api_key", "")))
+        self.tts_key_edit.setEchoMode(QLineEdit.Password)
+        self.tts_model_edit = QLineEdit(str(tts.get("model", "")))
+        self.voice_combo = QComboBox()
+        self.voice_combo.setEditable(True)
+        voices = ["Cherry", "Serena", "Ethan", "Chelsie"]
+        current_voice = str(tts.get("voice", "Cherry"))
+        if current_voice not in voices:
+            voices.insert(0, current_voice)
+        self.voice_combo.addItems(voices)
+        self.voice_combo.setCurrentText(current_voice)
+        form.addRow("TTS API 地址", self.tts_base_edit)
+        form.addRow("TTS API Key", self.tts_key_edit)
+        form.addRow("TTS 模型", self.tts_model_edit)
+        form.addRow("TTS 音色", self.voice_combo)
+        layout.addLayout(form)
+
+        hint = QLabel(
+            "开启后无需按键：先对着麦克风说唤醒词（默认 yumi）唤醒，"
+            "然后像打电话一样直接对话，每句话说完稍作停顿即可。\n"
+            "TTS Key 会自动复用已有百炼 Key；未配置时只显示文字回复。"
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #888;")
+        layout.addWidget(hint)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _split(self, text):
+        return [
+            part.strip()
+            for part in re.split(r"[、,，/|]", text)
+            if part.strip()
+        ]
+
+    def values(self):
+        return {
+            "enabled": self.enabled_check.isChecked(),
+            "wake_words": self._split(self.wake_edit.text()),
+            "silence_seconds": round(self.silence_spin.value(), 1),
+            "idle_timeout_seconds": self.idle_spin.value(),
+            "max_turns": self.turns_spin.value(),
+            "exit_phrases": self._split(self.exit_edit.text()),
+            "tts_enabled": self.tts_check.isChecked(),
+            "tts": {
+                "base_url": self.tts_base_edit.text().strip().rstrip("/"),
+                "api_key": self.tts_key_edit.text().strip(),
+                "model": self.tts_model_edit.text().strip(),
+                "voice": self.voice_combo.currentText().strip(),
+                "language_type": "Chinese",
+            },
+        }
+
+
 class PetBridge(QObject):
     """JS -> Python calls (menu, drag, chat)."""
 
@@ -1536,6 +2104,11 @@ class PetBridge(QObject):
         self.window.set_chat_mode(False)
 
     @Slot()
+    def tts_played(self):
+        """Soullink 朗读结束回调（语音对话期间用于恢复麦克风）。"""
+        self.window._on_tts_played()
+
+    @Slot()
     def voice_toggle(self):
         self.window.toggle_voice_recording()
 
@@ -1551,6 +2124,8 @@ class PetWindow(QWidget):
     voice_send = Signal(str)
     voice_ptt_down = Signal()
     voice_ptt_up = Signal()
+    voice_play = Signal(str)
+    voice_shot_requested = Signal()
 
     def __init__(self):
         super().__init__()
@@ -1581,7 +2156,8 @@ class PetWindow(QWidget):
         self.base_bh = float(BASE_H)
         chat_cfg = load_chat_config()
         self.chat_client = ChatClient(chat_cfg)
-        self.chat_history = []
+        self.memory_cfg = load_memory_config()
+        self.memory = pet_memory.PetMemory(self.memory_cfg, BASE_DIR)
         self.chat_mode = False
         self.chat_reply.connect(self._show_chat_reply)
         self.screen_cfg = load_screen_read_config()
@@ -1594,6 +2170,7 @@ class PetWindow(QWidget):
         self.soullink_cfg = load_soullink_config()
         self.soullink_runner = soullink_runner.SoullinkRunner()
         self.soullink_ready = False
+        self.soullink_classifier_ready = False
         self.soullink_event.connect(self._send_soullink_event)
         self.soullink_js.connect(self._run_js)
         self.soullink_status.connect(self._notify)
@@ -1634,6 +2211,27 @@ class PetWindow(QWidget):
             "hotkey_enabled"
         ):
             self._start_ptt()
+        self.voice_chat_cfg = load_voice_chat_config()
+        self.voice_recognizer.silence_duration = float(
+            self.voice_chat_cfg.get("silence_seconds", 0.8)
+        )
+        self._tts_client = TtsClient(self.voice_chat_cfg.get("tts") or {})
+        self.voice_chat_stop = threading.Event()
+        self.voice_chat_thread = None
+        self.voice_chat_active = False
+        self._play_done = threading.Event()
+        self._player = None
+        self._audio_output = None
+        self.voice_tts_done = threading.Event()
+        self._shot_result = None
+        self._shot_event = threading.Event()
+        self._voice_chat_auto_soullink = False
+        self.voice_play.connect(self._play_voice_file)
+        self.voice_shot_requested.connect(self._on_voice_shot_requested)
+        if self.voice_chat_cfg.get("enabled"):
+            QTimer.singleShot(
+                0, lambda: self.set_voice_chat_enabled(True)
+            )
         self.dragging = False
         self.drag_start_pos = None
         self.drag_start_window = None
@@ -2006,12 +2604,21 @@ class PetWindow(QWidget):
         self.voice_recognizer.cancel()
         self.voice_recognizer.shutdown()
         self._run_js("window.setVoiceInputEnabled(false)")
+        if self.voice_chat_active:
+            self.set_voice_chat_enabled(False)
+        self.voice_chat_cfg["enabled"] = False
+        save_voice_chat_config(self.voice_chat_cfg)
         self.apply_geometry()
         self.move_to_saved_position()
         self.view.resize(self.width(), self.height())
         self._run_js(f"window.setScale({self.scale})")
         self.set_state("idle")
         self.view.reload()
+
+    def _is_screen_look_request(self, text):
+        """判断一句话是否在请求看屏幕（“帮我看看”之类）。"""
+        t = str(text or "")
+        return any(keyword in t for keyword in SCREEN_LOOK_KEYWORDS)
 
     def handle_chat(self, text):
         text = " ".join(str(text).split())
@@ -2023,19 +2630,58 @@ class PetWindow(QWidget):
                 "'（还没有配置聊天接口，请在菜单的 聊天设置 里填写 api_key）', 5000)"
             )
             return
+        shot = None
+        if self._is_screen_look_request(text):
+            if not self.vision_client or not self.vision_client.ready():
+                self._run_js(
+                    "window.showChatReply("
+                    "'（我还没配置视觉接口，暂时看不了屏幕，"
+                    "请在菜单的 读屏幕设置 里填写 API 信息）', 6000)"
+                )
+                return
+            try:
+                # 截屏必须在界面线程完成（截屏前会先隐藏窗口）
+                shot = self._capture_screen_base64()
+            except Exception:
+                shot = None
         threading.Thread(
             target=self._chat_worker,
-            args=(text,),
+            args=(text, shot[0] if shot else None, shot[1] if shot else None),
             daemon=True,
         ).start()
 
-    def _chat_worker(self, text):
+    def _chat_worker(self, text, image_b64=None, mime=None):
+        success = False
+        screen_desc = None
         try:
-            reply = self.chat_client.chat(self.chat_history, text)
+            if image_b64:
+                try:
+                    screen_desc = self.vision_client.describe(
+                        image_b64, mime or "image/jpeg"
+                    )
+                except Exception:
+                    screen_desc = None
+            try:
+                # 短期记忆为主，长期记忆按相关度补充；都没有则按人设回答
+                history, memory_note = self.memory.dialogue_context(text)
+            except Exception:
+                history, memory_note = [], None
+            user_content = text
+            if screen_desc:
+                user_content = (
+                    f"{text}\n"
+                    f"（补充信息：我刚刚看了你的屏幕，看到的内容是：{screen_desc}。"
+                    "请参考屏幕内容自然回答我的问题，不要提及“看了屏幕”或识图。）"
+                )
+            reply = self.chat_client.chat(
+                history,
+                user_content,
+                memory_note=memory_note,
+            )
+            success = True
         except Exception as exc:
             reply = f"（连接失败：{exc}）"
-        self.chat_history.append({"role": "user", "content": text})
-        self.chat_history.append({"role": "assistant", "content": reply})
+        soullink_handled = False
         if self._soullink_usable():
             try:
                 intent = self.soullink_runner.classify(text)
@@ -2048,8 +2694,27 @@ class PetWindow(QWidget):
                         ensure_ascii=False,
                     )
                 )
-                return
-        self.chat_reply.emit(reply)
+                soullink_handled = True
+        if not soullink_handled:
+            self.chat_reply.emit(reply)
+        # 先展示回复，再落盘记忆；长期记忆提炼会再调一次模型，放在最后不阻塞气泡
+        try:
+            if success:
+                if screen_desc:
+                    self.memory.record_line(
+                        "user",
+                        f"（我看到的屏幕内容：{screen_desc}）",
+                        source="screen",
+                    )
+                self.memory.record_turn(
+                    text,
+                    reply,
+                    source="chat",
+                    extract=True,
+                    chat_client=self.chat_client,
+                )
+        except Exception:
+            pass
 
     def _show_chat_reply(self, reply):
         emotion = classify_emotion(reply)
@@ -2087,6 +2752,85 @@ class PetWindow(QWidget):
         with open(config_path, "w", encoding="utf-8") as f:
             json.dump(root, f, ensure_ascii=False, indent=2)
         self.chat_client = ChatClient(load_chat_config())
+
+    # ---------- 记忆 ----------
+
+    def set_memory_enabled(self, enabled):
+        enabled = bool(enabled)
+        self.memory_cfg["enabled"] = enabled
+        save_memory_config(self.memory_cfg)
+        self.memory.enabled = enabled
+        self._notify("记忆功能已开启" if enabled else "记忆功能已关闭")
+
+    def open_memory_settings(self):
+        cfg = load_memory_config()
+        dialog = MemorySettingsDialog(cfg, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        self.memory_cfg = dialog.values()
+        save_memory_config(self.memory_cfg)
+        self.memory = pet_memory.PetMemory(self.memory_cfg, BASE_DIR)
+        self._notify("记忆设置已保存")
+
+    def view_memory(self):
+        short = self.memory.short_term_entries()
+        long_entries = self.memory.long_term_entries()
+        lines = [f"【短期记忆】（最近 {len(short)} 条，保留最近 "
+                 f"{self.memory_cfg.get('short_term_max_messages', 40)} 条 / "
+                 f"{self.memory_cfg.get('short_term_max_hours', 24)} 小时内）"]
+        source_label = {
+            "chat": "",
+            "proactive": "（主动）",
+            "screen": "（读屏）",
+        }
+        for item in short[-30:]:
+            ts = item.get("ts", 0)
+            stamp = (
+                time.strftime("%m-%d %H:%M", time.localtime(ts))
+                if ts
+                else "--:--"
+            )
+            speaker = item.get("speaker") or item.get("role")
+            label = "你" if speaker == "user" else "yumi"
+            tag = source_label.get(item.get("source"), "")
+            lines.append(f"{stamp} {label}{tag}：{item.get('content', '')}")
+        lines.append("")
+        lines.append(f"【长期记忆】（共 {len(long_entries)} 条）")
+        for entry in sorted(
+            long_entries,
+            key=lambda e: (e.get("importance", 1), e.get("updated_at", 0)),
+            reverse=True,
+        ):
+            ts = entry.get("updated_at", 0)
+            stamp = time.strftime("%m-%d", time.localtime(ts)) if ts else ""
+            imp = entry.get("importance", 3)
+            lines.append(
+                f"- [重要度{imp}/5] {entry.get('content', '')}（{stamp} 更新）"
+            )
+        dialog = QDialog(self)
+        dialog.setWindowTitle("记忆")
+        dialog.setMinimumSize(560, 460)
+        dialog_layout = QVBoxLayout(dialog)
+        editor = QPlainTextEdit("\n".join(lines))
+        editor.setReadOnly(True)
+        dialog_layout.addWidget(editor)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(dialog.reject)
+        dialog_layout.addWidget(buttons)
+        dialog.exec()
+
+    def clear_memory(self):
+        answer = QMessageBox.question(
+            self,
+            "清空记忆",
+            "确定要清空所有短期记忆和长期记忆吗？\n此操作无法恢复。",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self.memory.clear()
+        self._notify("记忆已清空")
 
     # ---------- 主动发言 ----------
 
@@ -2152,7 +2896,24 @@ class PetWindow(QWidget):
                     "可以是关心、碎碎念、自言自语或分享此刻的心情。"
                     "不要使用 Markdown，不要提及你是 AI 或模型，不要加引号。"
                 )
-                reply = self.chat_client.chat([], prompt)
+                try:
+                    # 短期记忆为主，长期记忆按相关度补充；都没有则按人设回答
+                    history, memory_note = self.memory.dialogue_context(
+                        prompt, history_limit=8
+                    )
+                except Exception:
+                    history, memory_note = [], None
+                reply = self.chat_client.chat(
+                    history,
+                    prompt,
+                    memory_note=memory_note,
+                )
+                try:
+                    self.memory.record_line(
+                        "assistant", reply, source="proactive"
+                    )
+                except Exception:
+                    pass
             if not reply:
                 reply = random.choice(PROACTIVE_FALLBACK_LINES)
         except Exception:
@@ -2185,6 +2946,9 @@ class PetWindow(QWidget):
 
     def set_voice_input_enabled(self, enabled):
         enabled = bool(enabled)
+        if enabled and self.voice_chat_active:
+            # 语音输入与语音对话互斥：开启语音输入时自动关闭语音对话
+            self.set_voice_chat_enabled(False)
         self.voice_cfg["enabled"] = enabled
         save_voice_input_config(self.voice_cfg)
         if enabled:
@@ -2220,6 +2984,9 @@ class PetWindow(QWidget):
         return " + ".join(p.upper() for p in parts) + " + " + key
 
     def open_voice_input_settings(self):
+        if self.voice_chat_active:
+            # 要配置语音输入就先把语音对话关掉，避免两个流程抢麦克风
+            self.set_voice_chat_enabled(False)
         cfg = load_voice_input_config()
         dialog = VoiceInputSettingsDialog(cfg, self)
         if dialog.exec() != QDialog.Accepted:
@@ -2248,6 +3015,12 @@ class PetWindow(QWidget):
         self._notify("语音输入设置已更新")
 
     def toggle_voice_recording(self):
+        if self.voice_chat_active:
+            self._notify(
+                "语音对话正在运行：右键菜单 语音对话 → 关闭，"
+                "或直接说「退出对话」"
+            )
+            return
         if not self.voice_cfg.get("enabled"):
             self._notify("语音输入未开启，请在菜单中开启")
             return
@@ -2374,6 +3147,8 @@ class PetWindow(QWidget):
             self._ptt_stop_event.wait(0.06)
 
     def _on_ptt_down(self):
+        if self.voice_chat_active:
+            return
         if not self.voice_cfg.get("enabled"):
             return
         if not self.chat_mode:
@@ -2394,6 +3169,360 @@ class PetWindow(QWidget):
             return
         if self.voice_recording:
             self._voice_stop_and_send()
+
+    # ---------- 语音对话（免按键 + 唤醒词） ----------
+
+    def set_voice_chat_enabled(self, enabled):
+        enabled = bool(enabled)
+        if enabled:
+            if self.voice_chat_active:
+                return
+            old_thread = self.voice_chat_thread
+            if old_thread is not None and old_thread.is_alive():
+                old_thread.join(timeout=2.0)
+            if not self.chat_client or not self.chat_client.ready():
+                self.voice_chat_cfg["enabled"] = False
+                save_voice_chat_config(self.voice_chat_cfg)
+                self._notify("语音对话需要先配置聊天接口")
+                return
+            # 语音对话自动拉起 Soullink（表情驱动 + TTS 朗读）；关语音对话时若
+            # 是本功能自动开启的，则一并关闭
+            self._voice_chat_auto_soullink = False
+            if not self.soullink_cfg.get("enabled"):
+                self._voice_chat_auto_soullink = True
+                self.set_soullink_enabled(True)
+            self.voice_chat_cfg["enabled"] = True
+            save_voice_chat_config(self.voice_chat_cfg)
+            self.voice_chat_stop = threading.Event()
+            self.voice_chat_thread = threading.Thread(
+                target=self._voice_chat_loop, daemon=True
+            )
+            self.voice_chat_thread.start()
+            self.voice_chat_active = True
+            wake_words = self.voice_chat_cfg.get("wake_words") or ["yumi"]
+            wake = str(wake_words[0]) if wake_words else "yumi"
+            self._notify(f"语音对话已开启：说「{wake}」唤醒")
+            return
+        self.voice_chat_cfg["enabled"] = False
+        save_voice_chat_config(self.voice_chat_cfg)
+        self.voice_chat_stop.set()
+        self.voice_chat_active = False
+        if self._voice_chat_auto_soullink:
+            self._voice_chat_auto_soullink = False
+            self.set_soullink_enabled(False)
+        try:
+            # 中断可能正阻塞在“等下一句”里的监听线程
+            self.voice_recognizer.stop_continuous()
+        except Exception:
+            pass
+        thread = self.voice_chat_thread
+        self.voice_chat_thread = None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
+        self._notify("语音对话已关闭")
+
+    def open_voice_chat_settings(self):
+        cfg = load_voice_chat_config()
+        dialog = VoiceChatSettingsDialog(cfg, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        was_active = self.voice_chat_active
+        if was_active:
+            self.set_voice_chat_enabled(False)
+        self.voice_chat_cfg = dialog.values()
+        self._tts_client = TtsClient(self.voice_chat_cfg.get("tts") or {})
+        save_voice_chat_config(self.voice_chat_cfg)
+        self.voice_recognizer.silence_duration = float(
+            self.voice_chat_cfg.get("silence_seconds", 0.8)
+        )
+        # 断句时长变更需要重建录音器才生效
+        self.voice_recognizer.shutdown()
+        if was_active or self.voice_chat_cfg.get("enabled"):
+            self.set_voice_chat_enabled(True)
+        self._notify("语音对话设置已保存")
+
+    @staticmethod
+    def _text_after_wake(text, wake):
+        """取唤醒词之后的内容作为第一句话（例如“yumi 帮我看看”里的后半句）。"""
+        idx = str(text).lower().find(str(wake).lower())
+        if idx < 0:
+            return ""
+        rest = str(text)[idx + len(str(wake)) :].strip()
+        return rest.strip("，。,.！!？?、 ")
+
+    def _voice_chat_loop(self):
+        recognizer = self.voice_recognizer
+        stop = self.voice_chat_stop
+        cfg = self.voice_chat_cfg
+        wake_words = [
+            str(w).strip().lower()
+            for w in (cfg.get("wake_words") or ["yumi"])
+            if str(w).strip()
+        ]
+        exit_phrases = [
+            str(p).strip()
+            for p in (cfg.get("exit_phrases") or ["退出对话"])
+            if str(p).strip()
+        ]
+        idle_timeout = max(5, int(cfg.get("idle_timeout_seconds", 60)))
+        max_turns = max(1, int(cfg.get("max_turns", 50)))
+        wake_label = wake_words[0] if wake_words else "yumi"
+
+        if recognizer.needs_model():
+            self.voice_status.emit(
+                "正在下载语音识别模型（首次需要，可能几分钟）…"
+            )
+        if not recognizer.start_continuous():
+            self.voice_status.emit(
+                recognizer.error() or "语音识别启动失败，请检查麦克风"
+            )
+            # 启动失败也要复位状态，避免“关不掉”的假象
+            self.voice_chat_active = False
+            if self.voice_chat_cfg.get("enabled"):
+                self.voice_chat_cfg["enabled"] = False
+                try:
+                    save_voice_chat_config(self.voice_chat_cfg)
+                except Exception:
+                    pass
+            return
+
+        try:
+            while not stop.is_set():
+                # ---- 唤醒阶段：等待唤醒词 ----
+                self.voice_status.emit(
+                    f"👂 待唤醒：说「{wake_label}」开始对话"
+                )
+                first_turn = None
+                hit = None
+                while not stop.is_set():
+                    # 一直等下一句，说唤醒词即可（关闭时自动中断）
+                    text = recognizer.recognize_utterance(cancel=stop)
+                    if stop.is_set():
+                        break
+                    if not text:
+                        continue
+                    low = text.lower()
+                    hit = next(
+                        (w for w in wake_words if w in low), None
+                    )
+                    if hit:
+                        remainder = self._text_after_wake(text, hit)
+                        if remainder:
+                            first_turn = remainder
+                        break
+                if stop.is_set() or hit is None:
+                    break
+
+                # ---- 对话阶段：连续语音聊天 ----
+                self.voice_status.emit("🔔 在呢！我在听，直接说～")
+                turn = 0
+                if first_turn:
+                    self.voice_status.emit("💭 正在思考…")
+                    try:
+                        self._voice_turn(first_turn)
+                    except Exception:
+                        self.voice_status.emit(
+                            "处理这句话时出了点问题，再说一次？"
+                        )
+                    turn = 1
+                while not stop.is_set() and turn < max_turns:
+                    text = recognizer.recognize_utterance(
+                        timeout=idle_timeout, cancel=stop
+                    )
+                    if stop.is_set():
+                        break
+                    if text is None:
+                        self.voice_status.emit(
+                            "😴 聊得差不多了，有事再叫我～"
+                        )
+                        break
+                    if not text:
+                        continue
+                    if any(phrase in text for phrase in exit_phrases):
+                        self.voice_status.emit("👋 好的，随时叫我～")
+                        break
+                    self.voice_status.emit("💭 正在思考…")
+                    try:
+                        self._voice_turn(text)
+                    except Exception:
+                        self.voice_status.emit(
+                            "处理这句话时出了点问题，再说一次？"
+                        )
+                    turn += 1
+        finally:
+            try:
+                recognizer.stop_continuous()
+            except Exception:
+                pass
+            self.voice_chat_active = False
+            if self.voice_chat_cfg.get("enabled"):
+                self.voice_chat_cfg["enabled"] = False
+                try:
+                    save_voice_chat_config(self.voice_chat_cfg)
+                except Exception:
+                    pass
+
+    def _voice_turn(self, text):
+        """处理一句语音：可选读屏 + 聊天 + 记忆 + 气泡 + TTS 朗读。"""
+        screen_desc = None
+        user_content = text
+        if (
+            self._is_screen_look_request(text)
+            and self.vision_client
+            and self.vision_client.ready()
+        ):
+            shot = self._request_screen_shot()
+            if shot:
+                try:
+                    screen_desc = self.vision_client.describe(shot[0], shot[1])
+                except Exception:
+                    screen_desc = None
+        if screen_desc:
+            user_content = (
+                f"{text}\n"
+                f"（补充信息：我刚刚看了你的屏幕，看到的内容是：{screen_desc}。"
+                "请参考屏幕内容自然回答我的问题，不要提及“看了屏幕”或识图。）"
+            )
+        try:
+            history, memory_note = self.memory.dialogue_context(
+                text, history_limit=8
+            )
+            reply = self.chat_client.chat(
+                history, user_content, memory_note=memory_note
+            )
+            try:
+                if screen_desc:
+                    self.memory.record_line(
+                        "user",
+                        f"（我看到的屏幕内容：{screen_desc}）",
+                        source="screen",
+                    )
+                self.memory.record_turn(
+                    text,
+                    reply,
+                    source="voice",
+                    extract=True,
+                    chat_client=self.chat_client,
+                )
+            except Exception:
+                pass
+        except Exception as exc:
+            reply = f"（连接失败：{exc}）"
+        # 优先走 Soullink：表情驱动 + TTS 朗读（JS 播放结束回调后恢复麦克风）
+        if (
+            self._soullink_usable()
+            and self.soullink_classifier_ready
+            and reply
+            and not reply.startswith("（")
+        ):
+            try:
+                intent = self.soullink_runner.classify(text)
+            except Exception:
+                intent = None
+            if intent:
+                self.voice_recognizer.set_microphone(False)
+                try:
+                    self.voice_tts_done.clear()
+                    self.soullink_event.emit(
+                        json.dumps(
+                            {"reply": reply, "intent": intent},
+                            ensure_ascii=False,
+                        )
+                    )
+                    # 等 JS 朗读完再恢复收音，避免听到自己的声音
+                    self.voice_tts_done.wait(timeout=60)
+                finally:
+                    self.voice_recognizer.set_microphone(True)
+                return
+        # 兜底：普通气泡 + 独立 TTS
+        self.chat_reply.emit(reply)
+        if (
+            self.voice_chat_cfg.get("tts_enabled")
+            and self._tts_client.ready()
+            and reply
+            and not reply.startswith("（")
+        ):
+            self.voice_status.emit("🔊 正在朗读…")
+            try:
+                # 朗读时暂停收音，避免桌宠“听到”自己的声音
+                self.voice_recognizer.set_microphone(False)
+                try:
+                    self._speak_voice(reply)
+                finally:
+                    self.voice_recognizer.set_microphone(True)
+            except Exception as exc:
+                self.voice_status.emit(f"TTS 失败：{exc}")
+
+    def _request_screen_shot(self):
+        """请求界面线程截屏并等待结果（语音对话线程不能直接操作界面）。"""
+        self._shot_result = None
+        self._shot_event.clear()
+        self.voice_shot_requested.emit()
+        self._shot_event.wait(timeout=15)
+        return self._shot_result
+
+    def _on_voice_shot_requested(self):
+        try:
+            self._shot_result = self._capture_screen_base64()
+        except Exception:
+            self._shot_result = None
+        finally:
+            self._shot_event.set()
+
+    def _speak_voice(self, text):
+        audio, mime = self._tts_client.synthesize(text)
+        if "wav" in mime:
+            ext = ".wav"
+        elif "mp3" in mime or "mpeg" in mime:
+            ext = ".mp3"
+        else:
+            ext = ".mp3"
+        path = os.path.join(
+            tempfile.gettempdir(), f"pet_tts_{int(time.time() * 1000)}{ext}"
+        )
+        try:
+            with open(path, "wb") as f:
+                f.write(audio)
+            self._play_done.clear()
+            self.voice_play.emit(path)
+            # 等待播放结束，但随时响应关闭语音对话
+            stop = self.voice_chat_stop
+            while not self._play_done.is_set():
+                if stop.is_set():
+                    break
+                self._play_done.wait(0.3)
+        finally:
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+
+    def _play_voice_file(self, path):
+        from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+
+        if self._player is None:
+            self._audio_output = QAudioOutput(self)
+            self._player = QMediaPlayer(self)
+            self._player.setAudioOutput(self._audio_output)
+            self._player.mediaStatusChanged.connect(self._on_media_status)
+        self._player.stop()
+        self._player.setSource(QUrl.fromLocalFile(path))
+        if self._audio_output is not None:
+            self._audio_output.setVolume(85)
+        self._player.play()
+
+    def _on_media_status(self, status):
+        from PySide6.QtMultimedia import QMediaPlayer
+
+        if status in (
+            QMediaPlayer.MediaStatus.EndOfMedia,
+            QMediaPlayer.MediaStatus.InvalidMedia,
+        ):
+            self._play_done.set()
+
+    def _on_tts_played(self):
+        """Soullink 朗读结束（由 JS 回调），恢复语音对话的麦克风。"""
+        self.voice_tts_done.set()
 
     # ---------- 读屏幕 ----------
 
@@ -2484,7 +3613,26 @@ class PetWindow(QWidget):
                 if not self.chat_client or not self.chat_client.ready():
                     reply = f"我看到屏幕上好像有：{desc}"
                 else:
-                    reply = self.chat_client.chat([], prompt)
+                    try:
+                        history, memory_note = self.memory.dialogue_context(
+                            prompt, history_limit=8
+                        )
+                    except Exception:
+                        history, memory_note = [], None
+                    reply = self.chat_client.chat(
+                        history,
+                        prompt,
+                        memory_note=memory_note,
+                    )
+                try:
+                    self.memory.record_turn(
+                        f"（我看到的屏幕内容：{desc}）",
+                        reply,
+                        source="screen",
+                        extract=False,
+                    )
+                except Exception:
+                    pass
         except Exception as exc:
             reply = f"（读屏幕失败：{exc}）"
         finally:
@@ -2562,6 +3710,7 @@ class PetWindow(QWidget):
                 self.soullink_ready = True
             except Exception as exc:
                 self.soullink_ready = False
+                self.soullink_classifier_ready = False
                 self.soullink_cfg["enabled"] = False
                 save_soullink_config(self.soullink_cfg)
                 self.chat_reply.emit(f"（Soullink 启动失败：{exc}）")
@@ -2571,6 +3720,7 @@ class PetWindow(QWidget):
                 ok, msg = self.soullink_runner.generate_profile(self.model_id)
                 if not ok:
                     self.soullink_ready = False
+                    self.soullink_classifier_ready = False
                     self.soullink_cfg["enabled"] = False
                     save_soullink_config(self.soullink_cfg)
                     self.soullink_runner.stop()
@@ -2587,12 +3737,14 @@ class PetWindow(QWidget):
                 "Soullink 情绪引擎已启动，正在初始化情绪语料（首次约 1 分钟）"
             )
             self.soullink_runner.wait_classifier_ready(
-                on_ready=lambda: self.soullink_status.emit(
-                    "Soullink 情绪识别已就绪"
-                )
+                on_ready=self._on_soullink_classifier_ready
             )
 
         threading.Thread(target=_start, daemon=True).start()
+
+    def _on_soullink_classifier_ready(self):
+        self.soullink_classifier_ready = True
+        self.soullink_status.emit("Soullink 情绪识别已就绪")
 
     def set_soullink_enabled(self, enabled):
         enabled = bool(enabled)
@@ -2607,6 +3759,7 @@ class PetWindow(QWidget):
             self._start_soullink_async()
         else:
             self.soullink_ready = False
+            self.soullink_classifier_ready = False
             self.soullink_runner.stop()
             self._run_js("window.setSoullinkEnabled(false)")
             # 关闭 Soullink 后立即恢复 Codex 状态动作匹配
@@ -2911,6 +4064,25 @@ class PetWindow(QWidget):
             menu.addAction(
                 QAction("聊天设置…", self, triggered=self.open_chat_settings)
             )
+            memory_menu = _new_menu("记忆", menu)
+            menu.addMenu(memory_menu)
+            memory_toggle = QAction("开启记忆", self, checkable=True)
+            memory_toggle.setChecked(bool(self.memory_cfg.get("enabled")))
+            memory_toggle.triggered.connect(self.set_memory_enabled)
+            memory_menu.addAction(memory_toggle)
+            memory_menu.addAction(
+                QAction(
+                    "记忆设置…",
+                    self,
+                    triggered=self.open_memory_settings,
+                )
+            )
+            memory_menu.addAction(
+                QAction("查看记忆…", self, triggered=self.view_memory)
+            )
+            memory_menu.addAction(
+                QAction("清空记忆", self, triggered=self.clear_memory)
+            )
             proactive_menu = _new_menu("主动发言", menu)
             menu.addMenu(proactive_menu)
             proactive_toggle = QAction(
@@ -2941,6 +4113,23 @@ class PetWindow(QWidget):
                     "语音输入设置…",
                     self,
                     triggered=self.open_voice_input_settings,
+                )
+            )
+            voice_chat_menu = _new_menu("语音对话", menu)
+            menu.addMenu(voice_chat_menu)
+            voice_chat_toggle = QAction(
+                "开启语音对话（免按键）", self, checkable=True
+            )
+            voice_chat_toggle.setChecked(
+                bool(self.voice_chat_cfg.get("enabled"))
+            )
+            voice_chat_toggle.triggered.connect(self.set_voice_chat_enabled)
+            voice_chat_menu.addAction(voice_chat_toggle)
+            voice_chat_menu.addAction(
+                QAction(
+                    "语音对话设置…",
+                    self,
+                    triggered=self.open_voice_chat_settings,
                 )
             )
             screen_menu = _new_menu("读屏幕", menu)
