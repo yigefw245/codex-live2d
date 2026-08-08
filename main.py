@@ -3,6 +3,7 @@ import base64
 import ctypes
 import json
 import os
+import queue
 import random
 import re
 import shutil
@@ -1073,6 +1074,55 @@ def classify_emotion(text):
     return best
 
 
+def _split_sentences(text):
+    """把文本按句末标点（。！？!?…/换行）切成句子。"""
+    parts = re.split(r"([。！？!?…]+|\n)", text)
+    sentences = []
+    i = 0
+    while i < len(parts):
+        seg = parts[i]
+        if i + 1 < len(parts) and re.match(
+            r"[。！？!?…]+|\n", parts[i + 1]
+        ):
+            sentences.append((seg + parts[i + 1]).strip())
+            i += 2
+        else:
+            if seg.strip():
+                sentences.append(seg.strip())
+            i += 1
+    return [s for s in sentences if s]
+
+
+class _SpeechChunker:
+    """流式文本 → 逐句 TTS 片段（未完成的句尾留在缓冲里）。"""
+
+    def __init__(self, max_len=80):
+        self.buf = ""
+        self.max_len = max_len
+
+    def feed(self, chunk):
+        self.buf += chunk
+        sentences = _split_sentences(self.buf)
+        if not sentences:
+            return []
+        if self.buf and self.buf[-1] not in "。！？!?…\n":
+            complete, pending = sentences[:-1], sentences[-1]
+        else:
+            complete, pending = sentences, ""
+        self.buf = pending
+        out = list(complete)
+        # 超长兜底：缓冲过长时整段发出，避免一直等句号
+        if len(self.buf) >= self.max_len:
+            out.append(self.buf)
+            self.buf = ""
+        return out
+
+    def flush(self):
+        out = [self.buf] if self.buf.strip() else []
+        self.buf = ""
+        return out
+
+
 class ChatClient:
     def __init__(self, cfg):
         self.base = str(cfg.get("base_url", CHAT_DEFAULTS["base_url"])).rstrip("/")
@@ -1090,6 +1140,53 @@ class ChatClient:
         messages.extend(history[-20:])
         messages.append({"role": "user", "content": text})
         return self.raw_complete(messages, max_tokens=300, timeout=timeout)
+
+    def chat_stream(self, history, text, memory_note=None, on_chunk=None, timeout=120):
+        """流式聊天（SSE）：逐字回调 on_chunk，返回完整回复。"""
+        messages = [{"role": "system", "content": self.persona}]
+        if memory_note:
+            messages.append({"role": "system", "content": memory_note})
+        messages.extend(history[-20:])
+        messages.append({"role": "user", "content": text})
+        body = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": 300,
+            "stream": True,
+        }
+        request = urllib.request.Request(
+            self.base + "/chat/completions",
+            data=json.dumps(body).encode("utf-8"),
+            headers={
+                "Authorization": "Bearer " + self.key,
+                "Content-Type": "application/json",
+            },
+        )
+        full = []
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            for raw in response:
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if payload == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(payload)
+                except Exception:
+                    continue
+                choices = obj.get("choices") or []
+                if not choices:
+                    continue
+                delta = (choices[0].get("delta") or {}).get("content") or ""
+                if delta:
+                    full.append(delta)
+                    if on_chunk:
+                        try:
+                            on_chunk(delta)
+                        except Exception:
+                            pass
+        return "".join(full)
 
     def raw_complete(self, messages, max_tokens=300, timeout=60):
         """直接发送一组消息并返回模型文本（记忆提炼等内部调用使用）。"""
@@ -2284,6 +2381,8 @@ class PetWindow(QWidget):
     chat_reply = Signal(str)
     chat_reply_quiet = Signal(str)
     soullink_event = Signal(str)
+    soullink_speech = Signal(str)
+    soullink_react = Signal(str)
     soullink_js = Signal(str)
     soullink_status = Signal(str)
     voice_text = Signal(str)
@@ -2341,6 +2440,8 @@ class PetWindow(QWidget):
         self.soullink_ready = False
         self.soullink_classifier_ready = False
         self.soullink_event.connect(self._send_soullink_event)
+        self.soullink_speech.connect(self._send_soullink_speech)
+        self.soullink_react.connect(self._send_soullink_react)
         self.soullink_js.connect(self._run_js)
         self.soullink_status.connect(self._notify)
         if self.soullink_cfg.get("enabled"):
@@ -2392,6 +2493,8 @@ class PetWindow(QWidget):
         self._player = None
         self._audio_output = None
         self.voice_tts_done = threading.Event()
+        self._tts_queue = queue.Queue()
+        threading.Thread(target=self._tts_queue_worker, daemon=True).start()
         self._shot_result = None
         self._shot_event = threading.Event()
         self.voice_play.connect(self._play_voice_file)
@@ -2855,26 +2958,26 @@ class PetWindow(QWidget):
                     f"（补充信息：我刚刚看了你的屏幕，看到的内容是：{screen_desc}。"
                     "请参考屏幕内容自然回答我的问题，不要提及“看了屏幕”或识图。）"
                 )
-            reply = self.chat_client.chat(
-                history,
-                user_content,
-                memory_note=memory_note,
+            # 流式生成 + 逐句朗读（出字就开始 TTS）
+            reply, speech_sent = self._stream_chat(
+                history, user_content, memory_note, text
             )
             success = True
         except Exception as exc:
             reply = f"（连接失败：{exc}）"
+        # 先展示回复
         soullink_handled = False
-        if self._soullink_usable():
+        if self._soullink_usable() and success and not self._is_error_reply(reply):
             try:
                 intent = self.soullink_runner.classify(text)
             except Exception:
                 intent = None
-            if intent and not self._is_error_reply(reply):
-                self.soullink_event.emit(
+            if intent:
+                # 朗读已由流式逐句完成，这里只做情绪反应
+                self.soullink_react.emit(
                     json.dumps(
                         {
                             "reply": reply,
-                            "speak_text": self._tts_text(reply),
                             "intent": intent,
                         },
                         ensure_ascii=False,
@@ -2883,7 +2986,11 @@ class PetWindow(QWidget):
                 soullink_handled = True
         if not soullink_handled:
             self.chat_reply.emit(reply)
-        # 先展示回复，再落盘记忆；长期记忆提炼会再调一次模型，放在最后不阻塞气泡
+        # 等独立 TTS 队列播完；再落盘记忆（提炼放最后不阻塞展示）
+        try:
+            self._tts_queue.join()
+        except Exception:
+            pass
         try:
             if success:
                 if screen_desc:
@@ -3589,6 +3696,49 @@ class PetWindow(QWidget):
                 except Exception:
                     pass
 
+    def _stream_chat(self, history, user_content, memory_note, text):
+        """流式聊天 + 逐句朗读；返回 (完整回复, 是否发出了朗读)。"""
+        chunker = _SpeechChunker()
+        sent_speech = [0]
+        soullink_mode = self._soullink_usable()
+        standalone_ok = bool(
+            self.voice_chat_cfg.get("tts_enabled")
+            and self._tts_client.ready()
+        )
+
+        def _push(sentence):
+            clean = self._tts_text(sentence)
+            if not clean:
+                return
+            if soullink_mode:
+                self.soullink_speech.emit(clean)
+            elif standalone_ok:
+                self._tts_queue.put(clean)
+            sent_speech[0] += 1
+
+        def _on_chunk(chunk):
+            for sentence in chunker.feed(chunk):
+                _push(sentence)
+
+        stream_ok = True
+        try:
+            reply = self.chat_client.chat_stream(
+                history,
+                user_content,
+                memory_note=memory_note,
+                on_chunk=_on_chunk,
+            )
+        except Exception:
+            stream_ok = False
+            # 流式不可用/中途失败：退回一次性请求
+            reply = self.chat_client.chat(
+                history, user_content, memory_note=memory_note
+            )
+        if stream_ok or sent_speech[0] == 0:
+            for sentence in chunker.flush():
+                _push(sentence)
+        return reply, sent_speech[0] > 0
+
     def _voice_turn(self, text):
         """处理一句语音：可选读屏 + 聊天 + 记忆 + 气泡 + TTS 朗读。"""
         _voice_chat_diag(f"turn text={text[:40]!r}")
@@ -3615,10 +3765,56 @@ class PetWindow(QWidget):
             history, memory_note = self.memory.dialogue_context(
                 text, history_limit=8
             )
-            reply = self.chat_client.chat(
-                history, user_content, memory_note=memory_note
+        except Exception:
+            history, memory_note = [], None
+        success = False
+        speech_sent = False
+        # 流式朗读期间静音麦克风（防自听自说），读完恢复
+        self.voice_recognizer.set_microphone(False)
+        self.voice_tts_done.clear()
+        try:
+            reply, speech_sent = self._stream_chat(
+                history, user_content, memory_note, text
             )
+            success = True
+        except Exception as exc:
+            reply = f"（连接失败：{exc}）"
+        try:
+            if speech_sent:
+                if self._soullink_usable():
+                    self.voice_tts_done.wait(timeout=90)
+                else:
+                    self._tts_queue.join()
+        finally:
+            self.voice_recognizer.set_microphone(True)
+        # 结尾情绪反应：朗读已由流式逐句完成，这里只做表情不重复朗读
+        if (
+            self._soullink_usable()
+            and success
+            and not self._is_error_reply(reply)
+        ):
             try:
+                intent = self.soullink_runner.classify(text)
+            except Exception:
+                intent = None
+            if intent:
+                self.soullink_react.emit(
+                    json.dumps(
+                        {
+                            "reply": reply,
+                            "intent": intent,
+                            "no_bubble": True,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+            else:
+                self.chat_reply_quiet.emit(reply)
+        else:
+            self.chat_reply_quiet.emit(reply)
+        # 记忆落盘（提炼放最后，不阻塞朗读）
+        try:
+            if success:
                 if screen_desc:
                     self.memory.record_line(
                         "user",
@@ -3632,83 +3828,8 @@ class PetWindow(QWidget):
                     extract=True,
                     chat_client=self.chat_client,
                 )
-            except Exception:
-                pass
-        except Exception as exc:
-            reply = f"（连接失败：{exc}）"
-        # 优先走 Soullink：与打字聊天同一条已验证的朗读路径
-        # （表情驱动 + TTS；JS 播放结束回调后恢复麦克风）
-        if (
-            self._soullink_usable()
-            and reply
-            and not self._is_error_reply(reply)
-        ):
-            _voice_chat_diag("soullink branch: usable, classifying")
-            try:
-                intent = self.soullink_runner.classify(text)
-            except Exception:
-                intent = None
-                _voice_chat_diag("classify error -> fallback")
-            if intent:
-                _voice_chat_diag("soullink branch: intent ok, emitting")
-                self.voice_status.emit("🔊 正在朗读…")
-                self.voice_recognizer.set_microphone(False)
-                try:
-                    self.voice_tts_done.clear()
-                    self.soullink_event.emit(
-                        json.dumps(
-                            {
-                                "reply": reply,
-                                "speak_text": self._tts_text(reply),
-                                "intent": intent,
-                                "no_bubble": True,
-                            },
-                            ensure_ascii=False,
-                        )
-                    )
-                    # 等 JS 朗读完再恢复收音，避免听到自己的声音
-                    waited_at = time.monotonic()
-                    self.voice_tts_done.wait(timeout=60)
-                    _voice_chat_diag(
-                        "tts_played waited "
-                        f"{time.monotonic() - waited_at:.1f}s"
-                    )
-                finally:
-                    self.voice_recognizer.set_microphone(True)
-                return
-            _voice_chat_diag("soullink branch: intent empty -> fallback")
-        else:
-            _voice_chat_diag(
-                "fallback: usable="
-                f"{self._soullink_usable()} reply={reply[:40]!r}"
-            )
-        # 兜底：普通气泡 + 独立 TTS
-        # 实时语音对话不出气泡，只做情绪表情
-        self.chat_reply_quiet.emit(reply)
-        if (
-            self.voice_chat_cfg.get("tts_enabled")
-            and self._tts_client.ready()
-            and reply
-            and not self._is_error_reply(reply)
-        ):
-            _voice_chat_diag("fallback: standalone tts starting")
-            self.voice_status.emit("🔊 正在朗读…")
-            try:
-                # 朗读时暂停收音，避免桌宠“听到”自己的声音
-                self.voice_recognizer.set_microphone(False)
-                try:
-                    self._speak_voice(self._tts_text(reply))
-                finally:
-                    self.voice_recognizer.set_microphone(True)
-            except Exception as exc:
-                self.voice_status.emit(f"TTS 失败：{exc}")
-                _voice_chat_diag(f"standalone tts error: {exc}")
-        else:
-            _voice_chat_diag(
-                "fallback skipped: tts_enabled="
-                f"{self.voice_chat_cfg.get('tts_enabled')} "
-                f"tts_ready={self._tts_client.ready()}"
-            )
+        except Exception:
+            pass
 
     def _request_screen_shot(self):
         """请求界面线程截屏并等待结果（语音对话线程不能直接操作界面）。"""
@@ -3717,6 +3838,18 @@ class PetWindow(QWidget):
         self.voice_shot_requested.emit()
         self._shot_event.wait(timeout=15)
         return self._shot_result
+
+    def _tts_queue_worker(self):
+        """独立 TTS 队列：逐句顺序朗读（Soullink 不可用时兜底）。"""
+        while True:
+            item = self._tts_queue.get()
+            if item is None:
+                break
+            try:
+                self._speak_voice(item)
+            except Exception:
+                pass
+            self._tts_queue.task_done()
 
     def _on_voice_shot_requested(self):
         try:
@@ -4158,6 +4291,16 @@ class PetWindow(QWidget):
 
     def _send_soullink_event(self, payload_json):
         self._run_js(f"window.soullinkChat({payload_json})")
+
+    def _send_soullink_speech(self, text):
+        """流式朗读片段：交给前端朗读队列逐句播放。"""
+        self._run_js(
+            f"window.soullinkSpeak({json.dumps(text, ensure_ascii=False)})"
+        )
+
+    def _send_soullink_react(self, payload_json):
+        """流式结束后的情绪反应（只做表情，不再重复朗读）。"""
+        self._run_js(f"window.soullinkReactOnly({payload_json})")
 
     def set_pet_state(self, name):
         self.pet_state = name

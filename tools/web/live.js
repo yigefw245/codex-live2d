@@ -19,6 +19,8 @@ let idlePoseName = null;
 let idlePoseEndAt = 0;
 let nextIdlePoseAt = 0;
 let soullinkActions = null;
+let speakQueue = Promise.resolve();
+let speakPending = 0;
 let soullink = { enabled: false, config: null, bridge: null, starting: null };
 
 function soullinkEnabled() {
@@ -587,6 +589,45 @@ window.soullinkChat = (payload) => {
         window.__bridge.tts_played();
       }
     });
+  }
+};
+
+// 流式朗读：逐句排队播放（上一句播完才播下一句），全部播完通知 Python。
+window.soullinkSpeak = (text) => {
+  if (!soullinkEnabled() || !soullink.bridge) return;
+  const t = String(text || "");
+  if (!t.trim()) return;
+  speakPending += 1;
+  speakQueue = speakQueue
+    .then(() =>
+      soullink.bridge.speak({
+        text: t,
+        emotion: "neutral",
+        vad: null,
+        intent: null
+      })
+    )
+    .catch(() => {})
+    .finally(() => {
+      speakPending -= 1;
+      if (
+        speakPending === 0 &&
+        window.__bridge &&
+        window.__bridge.tts_played
+      ) {
+        window.__bridge.tts_played();
+      }
+    });
+};
+
+// 流式结束后的情绪反应：只做表情/气泡，不再重复朗读。
+window.soullinkReactOnly = (payload) => {
+  if (!payload) return;
+  if (payload.reply && !payload.no_bubble) {
+    showChatReply(payload.reply, 6000);
+  }
+  if (payload.intent && soullinkEnabled() && soullink.bridge) {
+    soullink.bridge.react(payload.intent);
   }
 };
 
