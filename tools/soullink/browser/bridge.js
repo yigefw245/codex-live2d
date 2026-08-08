@@ -19,6 +19,7 @@ let lastNativeToken = -1;
 let started = false;
 let paramsHookAttached = false;
 let headTiltGain = 1;
+let poseKeys = null;
 
 function applyParamsHook() {
   const core = modelRef?.internalModel?.coreModel;
@@ -65,10 +66,14 @@ function applyNativeAnimation(snapshot) {
   lastNativeToken = directive.token;
 
   if (directive.expression && typeof modelRef.expression === "function") {
-    try {
-      void Promise.resolve(modelRef.expression(directive.expression)).catch(() => {});
-    } catch {
-      // ignore
+    // 手势表情（扶脸/看手机/记笔记/前倾）统一由前端手势系统触发，
+    // 引擎只保留面部表情（脸红/星星眼等），避免手势不归正、互相叠加。
+    if (!poseKeys || !poseKeys.includes(directive.expression)) {
+      try {
+        void Promise.resolve(modelRef.expression(directive.expression)).catch(() => {});
+      } catch {
+        // ignore
+      }
     }
   }
   if (directive.motion && typeof modelRef.motion === "function") {
@@ -132,6 +137,9 @@ async function start(config) {
   }
   headTiltGain =
     typeof config.headTiltGain === "number" ? config.headTiltGain : 1;
+  poseKeys = Array.isArray(config.poseKeys) && config.poseKeys.length
+    ? config.poseKeys
+    : null;
 
   const { profile } = await loadModelProfile(config.profileUrl);
   const style = motionStylePresets[config.motionStyle] || motionStylePresets.natural;
@@ -167,9 +175,12 @@ async function start(config) {
         for (let i = 0; i < binary.length; i += 1) {
           bytes[i] = binary.charCodeAt(i);
         }
+        const dur = Number(data.duration_sec);
         return {
           bytes: bytes.buffer,
-          durationSec: Number(data.duration_sec) || 0
+          // 侧服务未返回时长时按文本长度估算，保证“说话状态”覆盖整个朗读过程。
+          durationSec:
+            dur > 0 ? dur : Math.max(0.4, String(text).length * 0.28 + 0.5)
         };
       }
     },
@@ -183,9 +194,11 @@ async function start(config) {
   // 说话（SPEAKING）状态下 SDK 会主动压低情绪层权重并关闭空闲手势，
   // 导致回复时身体几乎不动。提高参数/身体增益，让情绪姿态与表情清晰可见。
   session.setParameterGain(2.2);
-  session.setBodyMotionGain(2.8);
-  if (typeof options.lipSyncGain === "number") {
-    session.setLipSyncGain(options.lipSyncGain);
+  session.setBodyMotionGain(
+    Math.min(4, Math.max(0, Number(config.bodyMotionGain) || 2.8))
+  );
+  if (typeof config.lipSyncGain === "number") {
+    session.setLipSyncGain(config.lipSyncGain);
   }
   session.start();
   started = true;
@@ -238,6 +251,12 @@ window.__soullink = {
   react,
   speak,
   stopVoice,
+  isSpeaking: () =>
+    Boolean(
+      session &&
+        typeof session.getRuntimeSnapshot === "function" &&
+        session.getRuntimeSnapshot().state === "SPEAKING"
+    ),
   isActive: () => started
 };
 

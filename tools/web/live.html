@@ -110,6 +110,29 @@ html, body {
   font-size: 14px;
   cursor: pointer;
 }
+/* 横向裁切后窗口变窄时，自动适配聊天框布局 */
+@media (max-width: 280px) {
+  #chat-back {
+    display: none;
+  }
+  #chat-input-row {
+    padding: 5px 6px;
+    gap: 4px;
+  }
+  #chat-mic {
+    width: 32px;
+    font-size: 15px;
+  }
+}
+@media (max-width: 210px) {
+  #chat-mic {
+    display: none;
+  }
+  #chat-send {
+    padding: 0 10px;
+    font-size: 13px;
+  }
+}
 </style>
 </head>
 <body>

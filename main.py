@@ -71,6 +71,7 @@ DEFAULT_SETTINGS = {
     "model": "yumi",
     "actions": {},
     "crop_bottom": 0.0,
+    "crop_side": 0.0,
 }
 
 
@@ -2035,11 +2036,34 @@ class SoullinkEmotionActionsDialog(QDialog):
         outer = QVBoxLayout(self)
         hint = QLabel(
             "为每个情绪选择对应的动作姿势（如 累 → 看手机、好奇 → 扶脸）。\n"
-            "选“默认”则使用生成器自带映射；不选默认姿势时该情绪不触发额外动作。"
+            "选“默认”则使用生成器自带映射；不选默认姿势时该情绪不触发额外动作。\n"
+            "注意：手势/姿势（看手机、记笔记、扶脸、前倾等）由统一手势系统调度，"
+            "作为情绪动作时可能不生效或与随机手势重叠。"
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #888;")
         outer.addWidget(hint)
+
+        pose_keys = {
+            key
+            for key, info in expressions.items()
+            if isinstance(info, dict) and info.get("kind") == "pose"
+        }
+        warn = QLabel(
+            "当前选择了手势/姿势作为情绪动作，可能不会生效，"
+            "或与随机手势系统出现重叠。建议改选表情（脸红、星星眼、泪光等）。"
+        )
+        warn.setWordWrap(True)
+        warn.setStyleSheet(
+            "color: #e8a33d; background: rgba(232,163,61,0.12);"
+            "padding: 6px; border-radius: 6px;"
+        )
+        warn.setVisible(False)
+        outer.addWidget(warn)
+
+        def _refresh_warning():
+            selected = {combo.currentData() for combo in self.combos.values()}
+            warn.setVisible(bool(selected & pose_keys))
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -2063,8 +2087,10 @@ class SoullinkEmotionActionsDialog(QDialog):
                 combo.addItem(opt_label, key)
             idx = combo.findData(str(current.get(emotion) or ""))
             combo.setCurrentIndex(max(0, idx))
+            combo.currentIndexChanged.connect(_refresh_warning)
             self.combos[emotion] = combo
             form.addRow(label, combo)
+        _refresh_warning()
         scroll.setWidget(body)
         outer.addWidget(scroll)
 
@@ -2680,6 +2706,10 @@ class PetWindow(QWidget):
             f"window.setCropBottom("
             f"{float(self.settings.get('crop_bottom', 0.0))})"
         )
+        self._run_js(
+            f"window.setCropSide("
+            f"{float(self.settings.get('crop_side', 0.0))})"
+        )
         self._push_soullink_config()
 
     def set_state(self, name):
@@ -2891,6 +2921,7 @@ class PetWindow(QWidget):
         self.settings = dict(DEFAULT_SETTINGS)
         save_settings(self.settings)
         self._run_js("window.setCropBottom(0)")
+        self._run_js("window.setCropSide(0)")
         self.model_id = "yumi"
         self.model_cfg = load_model_config("yumi") or {}
         self.scale = 1.0
@@ -4464,6 +4495,7 @@ class PetWindow(QWidget):
                     triggered=self.import_model_folder,
                 )
             )
+            menu.addSeparator()
 
             status_menu = _new_menu("状态动作", menu)
             menu.addMenu(status_menu)
@@ -4574,6 +4606,7 @@ class PetWindow(QWidget):
                     triggered=lambda: self.set_pet_state("idle"),
                 )
             )
+            menu.addSeparator()
             chat_action = QAction(
                 "聊天模式（角色对话）", self, checkable=True
             )
@@ -4619,7 +4652,7 @@ class PetWindow(QWidget):
                     triggered=self.open_proactive_settings,
                 )
             )
-            voice_menu = _new_menu("语音输入", menu)
+            voice_menu = _new_menu("语音", menu)
             menu.addMenu(voice_menu)
             voice_toggle_action = QAction(
                 "开启语音输入", self, checkable=True
@@ -4634,8 +4667,7 @@ class PetWindow(QWidget):
                     triggered=self.open_voice_input_settings,
                 )
             )
-            voice_chat_menu = _new_menu("语音对话", menu)
-            menu.addMenu(voice_chat_menu)
+            voice_menu.addSeparator()
             voice_chat_toggle = QAction(
                 "开启语音对话（免按键）", self, checkable=True
             )
@@ -4643,8 +4675,8 @@ class PetWindow(QWidget):
                 bool(self.voice_chat_cfg.get("enabled"))
             )
             voice_chat_toggle.triggered.connect(self.set_voice_chat_enabled)
-            voice_chat_menu.addAction(voice_chat_toggle)
-            voice_chat_menu.addAction(
+            voice_menu.addAction(voice_chat_toggle)
+            voice_menu.addAction(
                 QAction(
                     "语音对话设置…",
                     self,
@@ -4710,50 +4742,73 @@ class PetWindow(QWidget):
                 )
             )
             menu.addSeparator()
+            display_menu = _new_menu("显示", menu)
+            menu.addMenu(display_menu)
             lock_action = QAction(
                 "解锁拖动" if self.locked else "锁定拖动", self
             )
             lock_action.triggered.connect(self.toggle_lock)
-            menu.addAction(lock_action)
-            menu.addSeparator()
-            crop_menu = _new_menu("裁切（从脚底往上）", menu)
-            menu.addMenu(crop_menu)
-            crop_action = QWidgetAction(crop_menu)
-            crop_widget = QWidget()
-            crop_layout = QVBoxLayout(crop_widget)
-            crop_layout.setContentsMargins(12, 6, 16, 6)
-            crop_label = QLabel()
-            crop_slider = QSlider(Qt.Horizontal)
-            crop_slider.setRange(0, 90)
-            crop_slider.setValue(
-                int(round(float(self.settings.get("crop_bottom", 0.0)) * 100))
+            display_menu.addAction(lock_action)
+            display_menu.addSeparator()
+            crop_menu = _new_menu("裁切（底部 / 两侧）", display_menu)
+            display_menu.addMenu(crop_menu)
+
+            def _make_crop_control(key, title, max_pct):
+                action = QWidgetAction(crop_menu)
+                widget = QWidget()
+                layout = QVBoxLayout(widget)
+                layout.setContentsMargins(12, 6, 16, 6)
+                label = QLabel()
+                slider = QSlider(Qt.Horizontal)
+                slider.setRange(0, max_pct)
+                slider.setValue(
+                    int(round(float(self.settings.get(key, 0.0)) * 100))
+                )
+                label.setText(f"{title} {slider.value()}%")
+                label.setStyleSheet("color: #c4b5fd; font-size: 12px;")
+                widget.setStyleSheet("background: transparent;")
+                layout.addWidget(label)
+                layout.addWidget(slider)
+                action.setDefaultWidget(widget)
+                crop_menu.addAction(action)
+
+                def _apply(_value):
+                    pct = slider.value()
+                    label.setText(f"{title} {pct}%")
+                    self.settings[key] = round(pct / 100.0, 2)
+                    save_settings(self.settings)
+                    self._run_js(
+                        f"window.setCropBottom({pct / 100.0})"
+                        if key == "crop_bottom"
+                        else f"window.setCropSide({pct / 100.0})"
+                    )
+
+                slider.valueChanged.connect(_apply)
+                return slider
+
+            crop_bottom_slider = _make_crop_control(
+                "crop_bottom", "裁切底部", 90
             )
-            crop_label.setText(f"裁切底部 {crop_slider.value()}%")
-            crop_label.setStyleSheet("color: #c4b5fd; font-size: 12px;")
-            crop_widget.setStyleSheet("background: transparent;")
-            crop_layout.addWidget(crop_label)
-            crop_layout.addWidget(crop_slider)
-            crop_action.setDefaultWidget(crop_widget)
-            crop_menu.addAction(crop_action)
-
-            def _apply_crop(_value):
-                pct = crop_slider.value()
-                crop_label.setText(f"裁切底部 {pct}%")
-                self.settings["crop_bottom"] = round(pct / 100.0, 2)
-                save_settings(self.settings)
-                self._run_js(f"window.setCropBottom({pct / 100.0})")
-
-            crop_slider.valueChanged.connect(_apply_crop)
+            crop_side_slider = _make_crop_control(
+                "crop_side", "裁切两侧", 45
+            )
             crop_menu.addAction(
                 QAction(
                     "重置裁切（0%）",
                     self,
-                    triggered=lambda: crop_slider.setValue(0),
+                    triggered=lambda: (
+                        crop_bottom_slider.setValue(0),
+                        crop_side_slider.setValue(0),
+                    ),
                 )
             )
-            menu.addSeparator()
-            menu.addAction(QAction("放大", self, triggered=self.scale_up))
-            menu.addAction(QAction("缩小", self, triggered=self.scale_down))
+            display_menu.addSeparator()
+            display_menu.addAction(
+                QAction("放大", self, triggered=self.scale_up)
+            )
+            display_menu.addAction(
+                QAction("缩小", self, triggered=self.scale_down)
+            )
             menu.addSeparator()
             menu.addAction(
                 QAction(

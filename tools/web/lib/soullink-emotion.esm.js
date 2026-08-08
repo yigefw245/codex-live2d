@@ -6256,6 +6256,8 @@ var modelRef = null;
 var lastNativeToken = -1;
 var started = false;
 var paramsHookAttached = false;
+var headTiltGain = 1;
+var poseKeys = null;
 function applyParamsHook() {
   const core = modelRef?.internalModel?.coreModel;
   if (!core || typeof core.setParameterValueById !== "function") return;
@@ -6272,6 +6274,19 @@ function applyParamsHook() {
     } catch {
     }
   }
+  if (!suppressed.has("ParamAngleZ") && typeof core.getParameterIndex === "function" && core.getParameterIndex("ParamAngleZ") >= 0) {
+    let z = core.getParameterValueById("ParamAngleZ");
+    if (headTiltGain !== 1) {
+      z = Math.max(-30, Math.min(30, z * headTiltGain));
+    }
+    if (snapshot.state === "SPEAKING") {
+      z = Math.max(-30, Math.min(30, z + 7 * headTiltGain));
+    }
+    try {
+      core.setParameterValueById("ParamAngleZ", z, 1);
+    } catch {
+    }
+  }
 }
 function applyNativeAnimation(snapshot) {
   const directive = snapshot?.nativeAnimation;
@@ -6279,10 +6294,12 @@ function applyNativeAnimation(snapshot) {
   if (directive.token === lastNativeToken) return;
   lastNativeToken = directive.token;
   if (directive.expression && typeof modelRef.expression === "function") {
-    try {
-      void Promise.resolve(modelRef.expression(directive.expression)).catch(() => {
-      });
-    } catch {
+    if (!poseKeys || !poseKeys.includes(directive.expression)) {
+      try {
+        void Promise.resolve(modelRef.expression(directive.expression)).catch(() => {
+        });
+      } catch {
+      }
     }
   }
   if (directive.motion && typeof modelRef.motion === "function") {
@@ -6330,6 +6347,8 @@ async function start(config) {
   if (!config || !config.profileUrl || !config.ttsUrl) {
     throw new Error("soullink bridge: missing profileUrl or ttsUrl");
   }
+  headTiltGain = typeof config.headTiltGain === "number" ? config.headTiltGain : 1;
+  poseKeys = Array.isArray(config.poseKeys) && config.poseKeys.length ? config.poseKeys : null;
   const { profile } = await loadModelProfile(config.profileUrl);
   const style = motionStylePresets[config.motionStyle] || motionStylePresets.natural;
   session = createSoullinkSession({
@@ -6363,9 +6382,11 @@ async function start(config) {
         for (let i = 0; i < binary.length; i += 1) {
           bytes[i] = binary.charCodeAt(i);
         }
+        const dur = Number(data.duration_sec);
         return {
           bytes: bytes.buffer,
-          durationSec: Number(data.duration_sec) || 0
+          // 侧服务未返回时长时按文本长度估算，保证“说话状态”覆盖整个朗读过程。
+          durationSec: dur > 0 ? dur : Math.max(0.4, String(text).length * 0.28 + 0.5)
         };
       }
     },
@@ -6379,6 +6400,9 @@ async function start(config) {
   session.setBodyMotionGain(
     Math.min(4, Math.max(0, Number(config.bodyMotionGain) || 2.8))
   );
+  if (typeof config.lipSyncGain === "number") {
+    session.setLipSyncGain(config.lipSyncGain);
+  }
   session.start();
   started = true;
   if (modelRef) attachParamsHook(modelRef);
@@ -6423,5 +6447,8 @@ window.__soullink = {
   react,
   speak,
   stopVoice,
+  isSpeaking: () => Boolean(
+    session && typeof session.getRuntimeSnapshot === "function" && session.getRuntimeSnapshot().state === "SPEAKING"
+  ),
   isActive: () => started
 };

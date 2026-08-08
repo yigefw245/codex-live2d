@@ -16,9 +16,31 @@ let lastReactAt = 0;
 let motionIntensity = 1;
 let headTiltGain = 1;
 let userCropBottom = 0;
-let idlePoseName = null;
-let idlePoseEndAt = 0;
+let userCropSide = 0;
+let poseName = null;
+let poseEndAt = 0;
 let nextIdlePoseAt = 0;
+let nextSpeakPoseAt = 0;
+let baseModelY = null;
+let speakEnv = 0;
+let bodyPhase = 0;
+let lookX = 0;
+let lookTX = 0;
+let lookPhase = "pause";
+let lookPhaseEndAt = 0;
+let lastXDir = 1;
+let lookDownTarget = 0;
+let lookDownY = 0;
+let burst = null;
+let nextBurstAt = 0;
+let tiltCur = 0;
+let tiltTarget = 0;
+let nextTiltAt = 0;
+let gravY = 0;
+let gravV = 0;
+let speakTiltZ = null;
+let speakTiltY = null;
+let recZ = 0;
 let soullinkActions = null;
 let speakQueue = Promise.resolve();
 let speakPending = 0;
@@ -95,6 +117,14 @@ function cropBottom() {
   );
 }
 
+// 单模型两侧裁切比例（0-0.45），左右对称往中间裁。
+function cropSide() {
+  return Math.max(
+    (modelConfig && modelConfig.crop && modelConfig.crop.side) || 0,
+    userCropSide
+  );
+}
+
 // 状态动作解析：手动指定优先；未指定 / 指定项不存在时回退默认配置。
 function resolveStatusAction(name) {
   const ov = actionOverrides[name] || {};
@@ -160,6 +190,28 @@ function setParam(id, value) {
   } catch (e) {
     /* ignore unknown parameters */
   }
+}
+
+function getParam(id) {
+  if (!model || !model.internalModel || !model.internalModel.coreModel) return 0;
+  try {
+    return model.internalModel.coreModel.getParameterValueById(id);
+  } catch (e) {
+    return 0;
+  }
+}
+
+// 手势姿势共用同一个槽位（待机/说话），通过直接参数开关，避免两个手势重叠。
+function applyPose(name, on) {
+  if (!name) return;
+  const params = EXPR_DATA[name];
+  if (!params) return;
+  for (const p of params) setParam(p.id, on ? p.value : 0);
+}
+
+function clearPose() {
+  if (poseName) applyPose(poseName, false);
+  poseName = null;
 }
 
 function stopAllMotions() {
@@ -534,7 +586,11 @@ window.setSoullinkConfig = async (cfg) => {
       bodyMotionGain: 2.8 * motionIntensity,
       lipSyncGain: typeof cfg.lipSyncGain === "number" ? cfg.lipSyncGain : 1,
       headTiltGain:
-        typeof cfg.headTiltGain === "number" ? cfg.headTiltGain : 1
+        typeof cfg.headTiltGain === "number" ? cfg.headTiltGain : 1,
+      poseKeys:
+        soullinkActions && soullinkActions.length
+          ? soullinkActions
+          : ["hand", "phone", "notes", "lean"]
     });
     soullink.enabled = true;
     if (model) bridge.setModel(model);
@@ -566,9 +622,8 @@ window.soullinkChat = (payload) => {
   // 实时语音对话（no_bubble）不显示文字气泡，其余照常显示
   if (payload.reply && !payload.no_bubble) showChatReply(payload.reply, 6000);
   if (intent) {
-    // 有情绪反应/说话时，让 SDK 表情接管，取消待机姿势及其恢复计时
-    idlePoseName = null;
-    idlePoseEndAt = 0;
+    // 有情绪反应/说话时，让 SDK 表情接管，取消手势姿势及其恢复计时
+    clearPose();
     nextIdlePoseAt =
       (performance.now ? performance.now() / 1000 : Date.now() / 1000) + 30;
     // 同一情绪在短时间内重复触发时跳过表情反应（避免连续“生气”导致黑脸不还原），
@@ -687,6 +742,7 @@ function reposition() {
   model.y +=
     (ch - STATUS_H - PAD - chatPanelH) -
     (b.y + b.height * (1 - cropBottom()));
+  baseModelY = model.y;
   computeHeadRef();
 }
 
@@ -701,7 +757,7 @@ function fitModel() {
   model.update(0.001);
   const b = model.getBounds();
   const fit = Math.min(
-    (cw - PAD * 2) / Math.max(1, b.width),
+    (cw - PAD * 2) / Math.max(1, b.width * (1 - cropSide())),
     regionH / Math.max(1, b.height * (1 - cropBottom()))
   );
   const s1 = s0 * fit;
@@ -752,7 +808,7 @@ function measureBounds() {
 function reportBounds() {
   if (window.__bridge && baseBounds) {
     window.__bridge.set_bounds(
-      baseBounds.w,
+      baseBounds.w * (1 - cropSide()),
       baseBounds.h * (1 - cropBottom())
     );
   }
@@ -809,35 +865,154 @@ function onFrame(ts) {
     model.update(dt);
     // Soullink 模式：身体/表情由 SDK 情绪引擎驱动，这里只补回鼠标追踪
     // （眼神全量跟随，头部/身体减半幅度，避免完全盖掉情绪姿态）。
-    // 待机小动作：长时间没互动时随机做扶脸/看手机/记笔记/前倾等姿势。
-    if (!idlePoseName && t >= nextIdlePoseAt && model.expression) {
-      const posePool = soullinkActions || ["hand", "phone", "notes", "lean"];
-      const poses = posePool.filter((name) => EXPR_DATA[name]);
-      if (poses.length && Math.random() < 0.7) {
-        idlePoseName = poses[Math.floor(Math.random() * poses.length)];
-        idlePoseEndAt = t + 4 + Math.random() * 3;
-        try {
-          model.expression(idlePoseName);
-        } catch (e) {
-          idlePoseName = null;
-        }
+    const speakingNow =
+      soullink.bridge && typeof soullink.bridge.isSpeaking === "function"
+        ? soullink.bridge.isSpeaking()
+        : false;
+    // 手势（待机/说话共用一套）：随机做扶脸/看手机/记笔记/前倾等姿势，
+    // 引擎不再触发手势表情，全部由这里统一调度，保证归正且不重叠。
+    const posePool = soullinkActions || ["hand", "phone", "notes", "lean"];
+    const poseOptions = posePool.filter((name) => EXPR_DATA[name]);
+    if (!poseName && poseOptions.length) {
+      if (!speakingNow && t >= nextIdlePoseAt && Math.random() < 0.7) {
+        poseName = poseOptions[Math.floor(Math.random() * poseOptions.length)];
+        poseEndAt = t + 4 + Math.random() * 3;
+        applyPose(poseName, true);
+        nextIdlePoseAt = t + 25 + Math.random() * 20;
+      } else if (speakingNow && t >= nextSpeakPoseAt && Math.random() < 0.7) {
+        poseName = poseOptions[Math.floor(Math.random() * poseOptions.length)];
+        poseEndAt = t + 3 + Math.random() * 2.5;
+        applyPose(poseName, true);
+        nextSpeakPoseAt = t + 4.5 + Math.random() * 3.5;
       }
-      nextIdlePoseAt = t + 25 + Math.random() * 20;
     }
-    if (idlePoseName && t >= idlePoseEndAt) {
-      try {
-        const em =
-          model.internalModel && model.internalModel.expressionManager;
-        if (em && em.stopAllExpressions) em.stopAllExpressions();
-      } catch (e) {}
-      idlePoseName = null;
+    if (poseName && t >= poseEndAt) {
+      clearPose();
       nextIdlePoseAt = t + 25 + Math.random() * 20;
+      nextSpeakPoseAt = t + 4.5 + Math.random() * 3.5;
+    }
+    // 手势看门狗：每帧把“非当前手势”的参数强制归零；
+    // 没有手势时全部归零，确保引擎残留或旧手势一定归正。
+    const poseKeys = soullinkActions || ["hand", "phone", "notes", "lean"];
+    for (const key of poseKeys) {
+      if (poseName && key === poseName) continue;
+      const pp = EXPR_DATA[key];
+      if (!pp) continue;
+      for (const p of pp) setParam(p.id, 0);
+    }
+    // 说话时自然动作组合：
+    // - 身体持续轻微摇晃（慢周期），头部滞后跟随身体；
+    // - 偶尔一次“重点点头”（随机间隔、随机朝向、平滑包络）；
+    // - 歪头每几秒随机微调一个角度；
+    // - 重力下沉只在说话开始时发生，说完平滑回弹回正。
+    if (speakingNow) {
+      speakEnv = Math.min(1, speakEnv + dt * 2.5);
+      bodyPhase += dt * ((Math.PI * 2) / 4.6);
+      if (speakTiltZ === null) {
+        // 说话开始时记录基准角度，之后用“基准 + 偏移”写入，避免叠加残留。
+        speakTiltZ = getParam("ParamAngleZ");
+        speakTiltY = getParam("ParamBodyAngleY");
+        nextBurstAt = t + 1.2 + Math.random() * 1.5;
+        tiltTarget = (Math.random() * 2 - 1) * 5;
+        nextTiltAt = t + 3 + Math.random() * 2;
+        lookPhase = "pause";
+        lookPhaseEndAt = t + 0.4 + Math.random() * 0.6;
+        lastXDir = Math.random() < 0.5 ? 1 : -1;
+      }
+      // 转头三段式：转向一侧 -> 回正 -> 短暂停留（随机时长）-> 换方向再来。
+      if (lookPhase === "turn" && t >= lookPhaseEndAt) {
+        lookTX = 0;
+        lookDownTarget = 0;
+        lookPhase = "return";
+        lookPhaseEndAt = t + 0.7 + Math.random() * 0.5;
+      } else if (lookPhase === "return" && t >= lookPhaseEndAt) {
+        lookPhase = "pause";
+        lookPhaseEndAt = t + 0.3 + Math.random() * 0.9;
+      } else if (lookPhase === "pause" && t >= lookPhaseEndAt) {
+        const dir = lastXDir >= 0 ? -1 : 1;
+        lookTX = dir * (18 + Math.random() * 12);
+        // 1/3 概率向下看（-15），2/3 不低头。
+        lookDownTarget = Math.random() < 1 / 3 ? -15 : 0;
+        lastXDir = dir;
+        lookPhase = "turn";
+        lookPhaseEndAt = t + 1.0 + Math.random() * 0.8;
+      }
+      if (!burst && t >= nextBurstAt) {
+        burst = {
+          start: t,
+          dur: 1.3 + Math.random() * 0.7,
+          sign: lookX >= 0 ? -1 : 1,
+          amp: 0.7 + Math.random() * 0.4
+        };
+        nextBurstAt = t + 3.5 + Math.random() * 4.5;
+      }
+      if (t >= nextTiltAt) {
+        tiltTarget = (Math.random() * 2 - 1) * 6;
+        nextTiltAt = t + 4 + Math.random() * 3;
+      }
+      recZ = 0;
+    } else {
+      speakEnv = Math.max(0, speakEnv - dt * 2.5);
+      burst = null;
+      tiltTarget = 0;
+      lookTX = 0;
+      lookDownTarget = 0;
+      lookPhase = "pause";
+      if (speakEnv <= 0.001) {
+        speakTiltZ = null;
+        speakTiltY = null;
+      }
+    }
+    // 身体微晃（幅度比待机大）+ 随机左右转头（不连续同向）。
+    const bodySway = 8 * speakEnv * Math.sin(bodyPhase);
+    const lookK = Math.min(1, dt * 3.2);
+    lookX += (lookTX - lookX) * lookK;
+    lookDownY += (lookDownTarget - lookDownY) * lookK;
+    // 重点点头：平滑包络，点头时同时低头，朝向随机。
+    let burstEnv = 0;
+    if (burst) {
+      const p = (t - burst.start) / burst.dur;
+      if (p >= 1) {
+        burst = null;
+      } else {
+        burstEnv = Math.sin(Math.PI * Math.min(1, p));
+      }
+    }
+    const burstTurn = burst ? burst.sign * 9 * burst.amp * burstEnv : 0;
+    // 歪头姿势微调：缓慢过渡。
+    tiltCur += (tiltTarget - tiltCur) * Math.min(1, dt * 2);
+    // 重力弹簧：说话时身体稍微下沉（带轻微回弹），说完平滑弹回。
+    const gravTarget = 5 * (model.scale.x || 1) * speakEnv;
+    const gk = 22;
+    const gd = speakingNow ? 3.2 : 5.5;
+    gravV += (gravTarget - gravY) * gk * dt - gravV * gd * dt;
+    gravY += gravV * dt;
+    if (baseModelY !== null) model.y = baseModelY + gravY;
+    if (speakTiltZ !== null) {
+      setParam(
+        "ParamAngleZ",
+        speakTiltZ +
+          tiltCur * speakEnv +
+          3 * speakEnv * Math.sin(bodyPhase + 1.2)
+      );
+      setParam(
+        "ParamBodyAngleY",
+        speakTiltY + bodySway + burstTurn * 0.5
+      );
+    }
+    // 说完话回正：把说话时残留的歪头快速拉回 0。
+    if (!speakingNow && recZ < 1) {
+      recZ = Math.min(1, recZ + dt * 2.2);
+      setParam("ParamAngleZ", getParam("ParamAngleZ") * (1 - recZ * 0.9));
     }
     setParam("ParamEyeBallX", eyeX);
     setParam("ParamEyeBallY", -eyeY * 0.9);
-    setParam("ParamAngleX", eyeX * 11);
-    setParam("ParamAngleY", -eyeY * 9);
-    setParam("ParamBodyAngleX", eyeX * 2.5);
+    setParam("ParamAngleX", eyeX * 11 + lookX + burstTurn);
+    setParam("ParamAngleY", -eyeY * 9 + lookDownY);
+    setParam(
+      "ParamBodyAngleX",
+      eyeX * 2.5 + 4 * speakEnv * Math.cos(bodyPhase)
+    );
   }
 
   app.render();
@@ -974,6 +1149,16 @@ window.setCropBottom = (v) => {
   if (model) {
     fitModel();
     reportBounds();
+  }
+};
+
+// 从两侧往中间裁切（百分比 0-45，每侧），裁掉的部分留在窗口外。
+window.setCropSide = (v) => {
+  const n = Number(v);
+  userCropSide = Number.isFinite(n) ? Math.min(0.45, Math.max(0, n)) : 0;
+  if (model) {
+    reportBounds();
+    reposition();
   }
 };
 
