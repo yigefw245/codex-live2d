@@ -1125,7 +1125,6 @@ window.playMotion = playMotion;
 window.stopMotion = stopMotion;
 window.setPetState = setPetState;
 window.setExpression = setExpression;
-window.notify = showBubble;
 window.setChatMode = setChatMode;
 window.showChatReply = showChatReply;
 window.chatReact = chatReact;
