@@ -450,6 +450,8 @@ SOULLINK_DEFAULTS = {
     "enabled": False,
     "motion_style": "natural",
     "motion_intensity": 1.0,
+    "lip_sync_gain": 1.0,
+    "head_tilt_gain": 1.0,
     "embedding": {
         "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
         "api_key": "",
@@ -783,6 +785,18 @@ def load_soullink_config():
         try:
             cfg["motion_intensity"] = max(
                 0.5, min(2.0, float(saved.get("motion_intensity", 1.0)))
+            )
+        except (TypeError, ValueError):
+            pass
+        try:
+            cfg["lip_sync_gain"] = max(
+                0.25, min(3.0, float(saved.get("lip_sync_gain", 1.0)))
+            )
+        except (TypeError, ValueError):
+            pass
+        try:
+            cfg["head_tilt_gain"] = max(
+                0.25, min(3.0, float(saved.get("head_tilt_gain", 1.0)))
             )
         except (TypeError, ValueError):
             pass
@@ -1896,6 +1910,18 @@ class SoullinkSettingsDialog(QDialog):
         self.intensity_spin.setDecimals(1)
         self.intensity_spin.setValue(float(cfg.get("motion_intensity", 1.0)))
         self.intensity_spin.setSuffix(" 倍")
+        self.lipsync_spin = QDoubleSpinBox()
+        self.lipsync_spin.setRange(0.25, 3.0)
+        self.lipsync_spin.setSingleStep(0.05)
+        self.lipsync_spin.setDecimals(2)
+        self.lipsync_spin.setValue(float(cfg.get("lip_sync_gain", 1.0)))
+        self.lipsync_spin.setSuffix(" 倍")
+        self.headtilt_spin = QDoubleSpinBox()
+        self.headtilt_spin.setRange(0.25, 3.0)
+        self.headtilt_spin.setSingleStep(0.05)
+        self.headtilt_spin.setDecimals(2)
+        self.headtilt_spin.setValue(float(cfg.get("head_tilt_gain", 1.0)))
+        self.headtilt_spin.setSuffix(" 倍")
 
         form.addRow("Embedding API 地址", self.embed_base_edit)
         form.addRow("Embedding API Key", self.embed_key_edit)
@@ -1906,6 +1932,8 @@ class SoullinkSettingsDialog(QDialog):
         form.addRow("TTS 音色", self.voice_combo)
         form.addRow("动作风格", self.style_combo)
         form.addRow("动作幅度（摇晃更明显）", self.intensity_spin)
+        form.addRow("嘴部幅度（说话张嘴）", self.lipsync_spin)
+        form.addRow("歪头幅度（待机/说话）", self.headtilt_spin)
         layout.addLayout(form)
 
         hint = QLabel(
@@ -1927,6 +1955,8 @@ class SoullinkSettingsDialog(QDialog):
         return {
             "motion_style": self.style_combo.currentText(),
             "motion_intensity": round(self.intensity_spin.value(), 1),
+            "lip_sync_gain": round(self.lipsync_spin.value(), 2),
+            "head_tilt_gain": round(self.headtilt_spin.value(), 2),
             "embedding": {
                 "base_url": self.embed_base_edit.text().strip().rstrip("/"),
                 "api_key": self.embed_key_edit.text().strip(),
@@ -4091,6 +4121,12 @@ class PetWindow(QWidget):
             "motionIntensity": float(
                 self.soullink_cfg.get("motion_intensity", 1.0)
             ),
+            "lipSyncGain": float(
+                self.soullink_cfg.get("lip_sync_gain", 1.0)
+            ),
+            "headTiltGain": float(
+                self.soullink_cfg.get("head_tilt_gain", 1.0)
+            ),
         }
         self.soullink_js.emit(
             f"window.setSoullinkConfig({json.dumps(payload, ensure_ascii=False)})"
@@ -4172,6 +4208,10 @@ class PetWindow(QWidget):
         self._run_js(
             f"window.setMotionIntensity("
             f"{float(self.soullink_cfg.get('motion_intensity', 1.0))})"
+        )
+        self._run_js(
+            f"window.setHeadTiltGain("
+            f"{float(self.soullink_cfg.get('head_tilt_gain', 1.0))})"
         )
         if self.soullink_ready and self.soullink_runner and self.soullink_runner.ready:
             # 配置变更后重启侧服务使新模型/Key 生效

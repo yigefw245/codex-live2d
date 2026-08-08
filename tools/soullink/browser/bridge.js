@@ -18,6 +18,7 @@ let modelRef = null;
 let lastNativeToken = -1;
 let started = false;
 let paramsHookAttached = false;
+let headTiltGain = 1;
 
 function applyParamsHook() {
   const core = modelRef?.internalModel?.coreModel;
@@ -34,6 +35,25 @@ function applyParamsHook() {
       core.setParameterValueById(id, value, 1);
     } catch {
       // ignore unknown parameters
+    }
+  }
+  // 歪头幅度：ParamAngleZ 整体放大；说话（SPEAKING）时再叠一个明显的歪头角度。
+  if (
+    !suppressed.has("ParamAngleZ") &&
+    typeof core.getParameterIndex === "function" &&
+    core.getParameterIndex("ParamAngleZ") >= 0
+  ) {
+    let z = core.getParameterValueById("ParamAngleZ");
+    if (headTiltGain !== 1) {
+      z = Math.max(-30, Math.min(30, z * headTiltGain));
+    }
+    if (snapshot.state === "SPEAKING") {
+      z = Math.max(-30, Math.min(30, z + 7 * headTiltGain));
+    }
+    try {
+      core.setParameterValueById("ParamAngleZ", z, 1);
+    } catch {
+      // ignore
     }
   }
 }
@@ -110,6 +130,8 @@ async function start(config) {
   if (!config || !config.profileUrl || !config.ttsUrl) {
     throw new Error("soullink bridge: missing profileUrl or ttsUrl");
   }
+  headTiltGain =
+    typeof config.headTiltGain === "number" ? config.headTiltGain : 1;
 
   const { profile } = await loadModelProfile(config.profileUrl);
   const style = motionStylePresets[config.motionStyle] || motionStylePresets.natural;
@@ -162,6 +184,9 @@ async function start(config) {
   // 导致回复时身体几乎不动。提高参数/身体增益，让情绪姿态与表情清晰可见。
   session.setParameterGain(2.2);
   session.setBodyMotionGain(2.8);
+  if (typeof options.lipSyncGain === "number") {
+    session.setLipSyncGain(options.lipSyncGain);
+  }
   session.start();
   started = true;
   if (modelRef) attachParamsHook(modelRef);

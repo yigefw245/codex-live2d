@@ -14,6 +14,7 @@ let chatReactTimer = null;
 let lastReactEmotion = null;
 let lastReactAt = 0;
 let motionIntensity = 1;
+let headTiltGain = 1;
 let userCropBottom = 0;
 let idlePoseName = null;
 let idlePoseEndAt = 0;
@@ -343,7 +344,10 @@ function applyMotion(dt) {
     setParam("ParamarmupL", 0);
     setParam("ParamarmupR", 0);
     setParam("Paramanime", 0);
-    setParam("ParamAngleZ", 6.0 * mi * Math.sin((t * Math.PI * 2) / 5));
+    setParam(
+      "ParamAngleZ",
+      6.0 * mi * headTiltGain * Math.sin((t * Math.PI * 2) / 5)
+    );
     setParam("ParamAngleX", 4.0 * mi * Math.sin((t * Math.PI * 2) / 7 + 1));
     setParam("ParamBodyAngleY", 3.5 * mi * Math.sin((t * Math.PI * 2) / 4.5));
     setParam("Paramdown1", 0);
@@ -514,6 +518,9 @@ window.setSoullinkConfig = async (cfg) => {
   if (cfg && typeof cfg.motionIntensity === "number") {
     window.setMotionIntensity(cfg.motionIntensity);
   }
+  if (cfg && typeof cfg.headTiltGain === "number") {
+    window.setHeadTiltGain(cfg.headTiltGain);
+  }
   if (!cfg || !cfg.enabled) {
     await stopSoullink();
     return;
@@ -524,7 +531,10 @@ window.setSoullinkConfig = async (cfg) => {
       profileUrl: cfg.profileUrl,
       ttsUrl: cfg.ttsUrl,
       motionStyle: cfg.motionStyle || "natural",
-      bodyMotionGain: 2.8 * motionIntensity
+      bodyMotionGain: 2.8 * motionIntensity,
+      lipSyncGain: typeof cfg.lipSyncGain === "number" ? cfg.lipSyncGain : 1,
+      headTiltGain:
+        typeof cfg.headTiltGain === "number" ? cfg.headTiltGain : 1
     });
     soullink.enabled = true;
     if (model) bridge.setModel(model);
@@ -949,6 +959,12 @@ window.chatReact = chatReact;
 window.setMotionIntensity = (v) => {
   const n = Number(v);
   motionIntensity = Number.isFinite(n) ? Math.min(2, Math.max(0.5, n)) : 1;
+};
+
+// 歪头幅度（0.25x - 3x）：待机歪头与说话时额外歪头统一按此放大。
+window.setHeadTiltGain = (v) => {
+  const n = Number(v);
+  headTiltGain = Number.isFinite(n) ? Math.min(3, Math.max(0.25, n)) : 1;
 };
 
 // 从脚底往上裁切（百分比 0-95），裁掉的底部留在窗口外。

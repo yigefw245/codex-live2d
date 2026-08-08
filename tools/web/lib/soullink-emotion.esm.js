@@ -4203,7 +4203,7 @@ var LipSyncController = class {
   }
   updateProcedural(timeSeconds, options) {
     const syllable = Math.sin(timeSeconds * 18.5) * 0.5 + Math.sin(timeSeconds * 31.2) * 0.25 + 0.5;
-    const mouthOpen = Math.max(0, syllable) * (0.18 + options.intensity * 0.34);
+    const mouthOpen = Math.max(0, syllable) * (0.34 + options.intensity * 0.56) * (options.lipGain ?? 1);
     return {
       mouthOpen,
       headX: Math.sin(timeSeconds * 2.6) * 0.018,
@@ -4230,7 +4230,7 @@ var LipSyncController = class {
     this.previousLevel = level;
     this.previousPeak = peak;
     const intensity = clamp(finiteOr2(options.intensity, 0), 0, 1);
-    const mouthGain = 0.18 + intensity * 0.34;
+    const mouthGain = (0.34 + intensity * 0.56) * clamp(options.lipGain ?? 1, 0.25, 3);
     const accent = clamp(this.accent, 0, 1);
     return {
       mouthOpen: clamp(this.smoothedLevel * mouthGain, 0, 1),
@@ -4925,6 +4925,7 @@ var SoullinkRuntime = class {
     __publicField(this, "bodyMotionGain", 1.25);
     __publicField(this, "idleEnabled", true);
     __publicField(this, "lipSyncEnabled", true);
+    __publicField(this, "lipSyncGain", 1);
     __publicField(this, "voicePlaybackActive", false);
     __publicField(this, "currentPlan", null);
     __publicField(this, "currentProactive", null);
@@ -4960,6 +4961,9 @@ var SoullinkRuntime = class {
   }
   setLipSyncEnabled(enabled) {
     this.lipSyncEnabled = enabled;
+  }
+  setLipSyncGain(gain) {
+    this.lipSyncGain = clamp(gain, 0.25, 3);
   }
   setMotionStyle(options) {
     this.motionStyle = resolveMotionStyle(
@@ -5214,6 +5218,7 @@ var SoullinkRuntime = class {
       enabled: this.lipSyncEnabled,
       speaking: this.voicePlaybackActive,
       intensity: this.currentIntent?.intensity ?? 0,
+      lipGain: this.lipSyncGain,
       deltaSeconds,
       speechAccentGain: this.motionStyle.speechAccentGain,
       ...audioInput
@@ -6063,6 +6068,7 @@ function createSoullinkSession(options) {
     setAutoVoiceEnabled,
     setIdleEnabled: (enabled) => runtime.setIdleEnabled(enabled),
     setLipSyncEnabled: (enabled) => runtime.setLipSyncEnabled(enabled),
+    setLipSyncGain: (gain) => runtime.setLipSyncGain(gain),
     setManualFACS: (facs) => runtime.setManualFACS(facs),
     setManualActionUnits: (actionUnits) => runtime.setManualActionUnits(actionUnits),
     setManualParameters: (parameters) => runtime.setCustomChannels(parameters),
