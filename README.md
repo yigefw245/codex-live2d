@@ -1,6 +1,6 @@
 # Codex Live2D 桌宠
 
-> **v4.0.0**：流式 TTS（边出字边朗读）、本地记忆、免按键语音对话、可自定义的 Soullink 动作。详见 [CHANGELOG.md](CHANGELOG.md)。
+> **v4.0.0**：流式 TTS（DeepSeek 边出字边朗读）。完整历史见 [CHANGELOG.md](CHANGELOG.md)（v3.0.0 为本地记忆、免按键语音对话、可自定义的 Soullink 动作等）。
 
 一个「**记得住、听得懂、看得见**」的 Live2D 桌面伙伴：用语音喊一声就醒、回复边生成边朗读，记得你说过的话，说"帮我看看"它会真的看你的屏幕，还能感知 Codex 的运行状态。内置 **yumi** 模型，支持随时切换或导入其他 Live2D 模型。
 
