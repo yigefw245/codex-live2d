@@ -46,6 +46,7 @@ from PySide6.QtWebEngineCore import QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
 import codex_monitor
+import numen_bridge
 import pet_memory
 import soullink_runner
 
@@ -476,6 +477,19 @@ PROACTIVE_DEFAULTS = {
     "min_interval_minutes": 3,
 }
 
+MINECRAFT_DEFAULTS = {
+    "enabled": False,
+    "host": "127.0.0.1",
+    "port": 8765,
+    "companion": "yumi",
+    "goal": "自由探索当前世界：挖点有用的矿物（铁、煤），注意安全别掉进岩浆，顺便看看周围有什么有趣的东西。",
+    "loop_enabled": True,
+    "narration": True,
+    "loop_interval_seconds": 8,
+    "max_actions_per_turn": 5,
+    "call_timeout_seconds": 300,
+}
+
 VOICE_INPUT_DEFAULTS = {
     "enabled": False,
     "model": "small",
@@ -861,6 +875,45 @@ def save_proactive_config(cfg):
         json.dump(root, f, ensure_ascii=False, indent=2)
 
 
+def load_minecraft_config():
+    """读取 Minecraft（Numen）配置：开关、连接信息、玩法目标。"""
+    cfg = dict(MINECRAFT_DEFAULTS)
+    try:
+        with open(os.path.join(BASE_DIR, "config.json"), encoding="utf-8") as f:
+            saved = json.load(f).get("minecraft") or {}
+        if isinstance(saved, dict):
+            for key in (
+                "enabled",
+                "loop_enabled",
+                "narration",
+            ):
+                if isinstance(saved.get(key), bool):
+                    cfg[key] = saved[key]
+            for key in ("host", "companion", "goal"):
+                if isinstance(saved.get(key), str) and saved[key].strip():
+                    cfg[key] = saved[key].strip()
+            for key in ("port", "loop_interval_seconds", "max_actions_per_turn", "call_timeout_seconds"):
+                try:
+                    cfg[key] = max(1, int(saved.get(key, cfg[key])))
+                except (TypeError, ValueError):
+                    pass
+    except Exception:
+        pass
+    return cfg
+
+
+def save_minecraft_config(cfg):
+    config_path = os.path.join(BASE_DIR, "config.json")
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            root = json.load(f)
+    except Exception:
+        root = {}
+    root["minecraft"] = cfg
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(root, f, ensure_ascii=False, indent=2)
+
+
 def load_voice_input_config():
     """读取语音输入配置：开关 + 本地识别模型（RealtimeSTT / faster-whisper）。"""
     cfg = dict(VOICE_INPUT_DEFAULTS)
@@ -1221,6 +1274,32 @@ class ChatClient:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             data = json.loads(response.read().decode("utf-8"))
         return str(data["choices"][0]["message"]["content"]).strip()
+
+    def complete(self, messages, tools=None, timeout=120, max_tokens=1024):
+        """支持工具调用的一次性补全，返回 {"content": str, "tool_calls": [...]}。"""
+        body = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+        }
+        if tools:
+            body["tools"] = tools
+            body["tool_choice"] = "auto"
+        request = urllib.request.Request(
+            self.base + "/chat/completions",
+            data=json.dumps(body).encode("utf-8"),
+            headers={
+                "Authorization": "Bearer " + self.key,
+                "Content-Type": "application/json",
+            },
+        )
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        message = data["choices"][0]["message"]
+        return {
+            "content": str(message.get("content") or "").strip(),
+            "tool_calls": message.get("tool_calls") or [],
+        }
 
 
 class VisionClient:
@@ -2162,6 +2241,82 @@ class ProactiveSettingsDialog(QDialog):
         }
 
 
+class MinecraftSettingsDialog(QDialog):
+    """Minecraft（Numen）设置：连接信息 + 玩法目标 + 自主游玩参数。"""
+
+    def __init__(self, cfg, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Minecraft 设置（Numen）")
+        self.setModal(True)
+        self.setMinimumWidth(520)
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.host_edit = QLineEdit(str(cfg.get("host", "127.0.0.1")))
+        self.port_spin = QSpinBox()
+        self.port_spin.setRange(1, 65535)
+        self.port_spin.setValue(int(cfg.get("port", 8765)))
+        self.companion_edit = QLineEdit(str(cfg.get("companion", "yumi")))
+        self.companion_edit.setMaxLength(16)
+        self.goal_edit = QPlainTextEdit(str(cfg.get("goal", "")))
+        self.goal_edit.setFixedHeight(84)
+        self.loop_check = QCheckBox("自主游玩循环（开启后 Yumi 会按目标持续行动）")
+        self.loop_check.setChecked(bool(cfg.get("loop_enabled", True)))
+        self.narration_check = QCheckBox("播报旁白（语音朗读做了什么）")
+        self.narration_check.setChecked(bool(cfg.get("narration", True)))
+        self.interval_spin = QSpinBox()
+        self.interval_spin.setRange(5, 600)
+        self.interval_spin.setValue(int(cfg.get("loop_interval_seconds", 8)))
+        self.interval_spin.setSuffix(" 秒")
+        self.rounds_spin = QSpinBox()
+        self.rounds_spin.setRange(2, 30)
+        self.rounds_spin.setValue(int(cfg.get("max_actions_per_turn", 5)))
+        self.rounds_spin.setSuffix(" 轮")
+        self.timeout_spin = QSpinBox()
+        self.timeout_spin.setRange(30, 600)
+        self.timeout_spin.setValue(int(cfg.get("call_timeout_seconds", 300)))
+        self.timeout_spin.setSuffix(" 秒")
+
+        form.addRow("Numen 地址", self.host_edit)
+        form.addRow("Numen 端口", self.port_spin)
+        form.addRow("伙伴名称", self.companion_edit)
+        form.addRow("玩法目标", self.goal_edit)
+        form.addRow("", self.loop_check)
+        form.addRow("", self.narration_check)
+        form.addRow("每轮间隔", self.interval_spin)
+        form.addRow("每轮最多行动", self.rounds_spin)
+        form.addRow("工具超时", self.timeout_spin)
+        layout.addLayout(form)
+
+        hint = QLabel(
+            "前提：游戏已启动并加载 Numen 模组（单人存档或本地服务器均可）。"
+            "Yumi 会以“假玩家”身份进入世界，自己感知、决定并执行动作。\n"
+            "聊天或语音里说“去玩mc / 去挖矿 / 去冒险”也会让她立刻行动。"
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #888;")
+        layout.addWidget(hint)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def values(self):
+        return {
+            "host": self.host_edit.text().strip() or "127.0.0.1",
+            "port": self.port_spin.value(),
+            "companion": self.companion_edit.text().strip() or "yumi",
+            "goal": self.goal_edit.toPlainText().strip(),
+            "loop_enabled": self.loop_check.isChecked(),
+            "narration": self.narration_check.isChecked(),
+            "loop_interval_seconds": self.interval_spin.value(),
+            "max_actions_per_turn": self.rounds_spin.value(),
+            "call_timeout_seconds": self.timeout_spin.value(),
+        }
+
+
 class VoiceInputSettingsDialog(QDialog):
     """语音输入设置：本地识别模型（RealtimeSTT / faster-whisper）。"""
 
@@ -2449,6 +2604,7 @@ class PetWindow(QWidget):
     voice_ptt_up = Signal()
     voice_play = Signal(str)
     voice_shot_requested = Signal()
+    mc_status = Signal(str)
 
     def __init__(self):
         super().__init__()
@@ -2555,6 +2711,18 @@ class PetWindow(QWidget):
         self._shot_event = threading.Event()
         self.voice_play.connect(self._play_voice_file)
         self.voice_shot_requested.connect(self._on_voice_shot_requested)
+        self.mc_cfg = load_minecraft_config()
+        self.mc_status.connect(self._notify)
+        self.mc_brain = None
+        self.mc_stop = threading.Event()
+        self.mc_thread = None
+        self.mc_busy = False
+        self.mc_turn_lock = threading.Lock()
+        self.mc_last_error_ts = 0.0
+        self.mc_last_task = None
+        self.mc_last_result = None
+        if self.mc_cfg.get("enabled") and self.mc_cfg.get("loop_enabled"):
+            QTimer.singleShot(0, lambda: self.set_mc_enabled(True))
         if self.voice_chat_cfg.get("enabled"):
             QTimer.singleShot(
                 0, lambda: self.set_voice_chat_enabled(True)
@@ -2975,6 +3143,9 @@ class PetWindow(QWidget):
                 "window.showChatReply("
                 "'（还没有配置聊天接口，请在菜单的 聊天设置 里填写 api_key）', 5000)"
             )
+            return
+        if self.mc_cfg.get("enabled") and self._is_mc_request(text):
+            self._mc_play_turn(text)
             return
         shot = None
         if self._is_screen_look_request(text):
@@ -3803,6 +3974,9 @@ class PetWindow(QWidget):
     def _voice_turn(self, text):
         """处理一句语音：可选读屏 + 聊天 + 记忆 + 气泡 + TTS 朗读。"""
         _voice_chat_diag(f"turn text={text[:40]!r}")
+        if self.mc_cfg.get("enabled") and self._is_mc_request(text):
+            self._mc_play_turn(text)
+            return
         screen_desc = None
         user_content = text
         if (
@@ -3891,6 +4065,278 @@ class PetWindow(QWidget):
                 )
         except Exception:
             pass
+
+    # ---------- Minecraft（Numen） ----------
+
+    @staticmethod
+    def _is_mc_request(text):
+        """判断一句话是否在要求 Yumi 去《我的世界》里行动。"""
+        t = str(text or "").lower()
+        keywords = (
+            "玩mc",
+            "去玩mc",
+            "玩我的世界",
+            "去玩我的世界",
+            "我的世界",
+            "minecraft",
+            "去挖",
+            "挖矿",
+            "挖铁",
+            "铁矿",
+            "挖钻石",
+            "钻石",
+            "去冒险",
+            "去探索",
+            "继续玩",
+        )
+        return any(keyword in t for keyword in keywords)
+
+    def _mc_get_brain(self):
+        """构造（或复用）MC 大脑；聊天接口不可用时返回 None。"""
+        if not self.chat_client or not self.chat_client.ready():
+            self.mc_status.emit("（玩 MC 需要先配置聊天接口）")
+            return None
+        if self.mc_brain is None:
+            numen = numen_bridge.NumenClient(
+                host=self.mc_cfg.get("host", "127.0.0.1"),
+                port=int(self.mc_cfg.get("port", 8765)),
+                timeout=int(self.mc_cfg.get("call_timeout_seconds", 300)),
+            )
+            self.mc_brain = numen_bridge.McBrain(
+                numen=numen,
+                llm_complete=self.chat_client.complete,
+                cfg=self.mc_cfg,
+                persona=self.chat_client.persona,
+            )
+        return self.mc_brain
+
+    def _mc_narrate(self, text):
+        """MC 旁白出口：语音朗读 + 写入记忆（不弹聊天气泡）。"""
+        text = str(text or "").strip()
+        if not text:
+            return
+        if self.mc_cfg.get("narration", True):
+            self._emit_speech(text)
+        try:
+            self.memory.record_line("assistant", text, source="mc")
+        except Exception:
+            pass
+
+    def set_mc_enabled(self, enabled):
+        enabled = bool(enabled)
+        self.mc_cfg["enabled"] = enabled
+        save_minecraft_config(self.mc_cfg)
+        if enabled:
+            if self.mc_cfg.get("loop_enabled"):
+                if not self.mc_thread or not self.mc_thread.is_alive():
+                    self.mc_stop.clear()
+                    self.mc_thread = threading.Thread(
+                        target=self._mc_loop, daemon=True
+                    )
+                    self.mc_thread.start()
+            self.mc_status.emit("已开启 Minecraft：Yumi 去游戏里玩了")
+        else:
+            self.mc_stop.set()
+            self.mc_status.emit("已关闭 Minecraft")
+
+    def open_mc_settings(self):
+        cfg = load_minecraft_config()
+        dialog = MinecraftSettingsDialog(cfg, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        new_cfg = dict(cfg)
+        new_cfg.update(dialog.values())
+        was_enabled = bool(self.mc_cfg.get("enabled"))
+        new_cfg["enabled"] = was_enabled
+        self.mc_cfg = new_cfg
+        save_minecraft_config(self.mc_cfg)
+        # 连接信息可能变了，大脑需要重建
+        self.mc_brain = None
+        if was_enabled:
+            if new_cfg.get("loop_enabled"):
+                if not self.mc_thread or not self.mc_thread.is_alive():
+                    self.mc_stop.clear()
+                    self.mc_thread = threading.Thread(
+                        target=self._mc_loop, daemon=True
+                    )
+                    self.mc_thread.start()
+            else:
+                self.mc_stop.set()
+        self.mc_status.emit("Minecraft 设置已保存")
+
+    def mc_play_now(self):
+        goal = str(self.mc_cfg.get("goal") or "").strip()
+        self._mc_play_turn(goal or "自由探索，做点有意思的事")
+
+    def mc_stop_now(self):
+        """强制停止当前这一轮 MC 行动（卡住时用）。"""
+        self.mc_busy = False
+        if self.mc_brain is not None:
+            try:
+                self.mc_brain.abort()
+            except Exception:
+                pass
+        self.mc_status.emit("已停止当前 MC 行动")
+
+    def _mc_play_turn(self, text):
+        """用户要求时立刻让 Yumi 去 MC 里行动一轮。"""
+        if not self.mc_cfg.get("enabled"):
+            self.mc_status.emit("（Minecraft 还没开启，先到右键菜单开启）")
+            return
+        if self.mc_busy:
+            self.mc_status.emit("（Yumi 正在 MC 里忙，等这一轮结束）")
+            return
+        self.mc_busy = True
+
+        def job():
+            try:
+                try:
+                    self.memory.record_line(
+                        "user", str(text), source="mc"
+                    )
+                except Exception:
+                    pass
+                brain = self._mc_get_brain()
+                if brain is None:
+                    return
+                if self.mc_thread is None or not self.mc_thread.is_alive():
+                    brain.ready()
+                    brain.ensure_companion(self.mc_cfg.get("companion"))
+                # 上一个后台任务可能还在跑，先等它结束，避免你的指令排队太久
+                if not brain.wait_idle(
+                    timeout=120,
+                    on_progress=lambda msg: self.mc_status.emit(msg),
+                ):
+                    self.mc_status.emit(
+                        "（她还在忙上一件事，先等它结束）"
+                    )
+                # 模糊指令（“去玩mc / 继续玩 / 去冒险”）先让规划层想一个
+                # 短期任务；具体指令（“去挖点铁矿”）直接当作任务执行
+                status = brain.status_snapshot()
+                task = None
+                t = str(text or "").lower()
+                if any(k in t for k in ("玩mc", "去玩mc", "玩我的世界",
+                                        "去玩我的世界", "我的世界", "minecraft",
+                                        "继续玩", "去冒险", "去探索")):
+                    task = brain.plan_next_task(
+                        text,
+                        status_note=status,
+                        last_task=self.mc_last_task,
+                        last_result=self.mc_last_result,
+                    )
+                    if task and not task.startswith(("（规划", "（连接")):
+                        self.mc_status.emit(f"（想好了：{task}）")
+                    else:
+                        task = None
+                else:
+                    task = text
+                    self.mc_status.emit(f"（收到，这就去：{text[:40]}）")
+                with self.mc_turn_lock:
+                    narration = brain.run_turn(
+                        user_goal=text,
+                        task=task,
+                        status_note=status,
+                        max_rounds=int(
+                            self.mc_cfg.get("max_actions_per_turn", 5)
+                        ),
+                        turn_timeout=int(
+                            self.mc_cfg.get("call_timeout_seconds", 300)
+                        ),
+                        on_progress=lambda msg: self.mc_status.emit(msg),
+                    )
+                self.mc_last_task = task or text
+                self.mc_last_result = narration
+                if narration:
+                    self._mc_narrate(narration)
+            except numen_bridge.NumenError as exc:
+                self.mc_status.emit(
+                    f"（MC 连不上：{exc}，游戏启动了吗？）"
+                )
+            except Exception as exc:
+                self.mc_status.emit(f"（MC 出错了：{exc}）")
+            finally:
+                self.mc_busy = False
+
+        threading.Thread(target=job, daemon=True).start()
+
+    def _mc_loop(self):
+        """后台自主游玩循环：连接 -> 确保伙伴 -> 感知/决定/执行 -> 旁白。"""
+        brain = None
+        while not self.mc_stop.is_set():
+            if self.mc_busy:
+                try:
+                    self.mc_stop.wait(
+                        max(5, int(self.mc_cfg.get("loop_interval_seconds", 8)))
+                    )
+                except Exception:
+                    break
+                continue
+            try:
+                if brain is None:
+                    brain = self._mc_get_brain()
+                    if brain is None:
+                        break
+                    brain.ready()
+                    brain.ensure_companion(self.mc_cfg.get("companion"))
+                # 上一个后台任务可能还在跑（比如挖矿），先等它结束再安排新的，
+                # 避免任务叠加上去让 Yumi 来回跑
+                if not brain.wait_idle(
+                    timeout=120,
+                    on_progress=lambda msg: self.mc_status.emit(msg),
+                ):
+                    self.mc_status.emit(
+                        "（她还在忙上一件事，等它结束再安排）"
+                    )
+                    continue
+                with self.mc_turn_lock:
+                    # 规划层先想一个短期任务，再交给执行层做
+                    status = brain.status_snapshot()
+                    task = brain.plan_next_task(
+                        self.mc_cfg.get("goal") or "",
+                        status_note=status,
+                        last_task=self.mc_last_task,
+                        last_result=self.mc_last_result,
+                    )
+                    if task and not task.startswith(("（规划", "（连接")):
+                        self.mc_status.emit(f"（想好了：{task}）")
+                    else:
+                        task = None
+                    narration = brain.run_turn(
+                        user_goal=self.mc_cfg.get("goal") or "",
+                        task=task,
+                        status_note=status,
+                        max_rounds=int(
+                            self.mc_cfg.get("max_actions_per_turn", 5)
+                        ),
+                        turn_timeout=int(
+                            self.mc_cfg.get("call_timeout_seconds", 300)
+                        ),
+                        on_progress=lambda msg: self.mc_status.emit(msg),
+                    )
+                self.mc_last_task = task
+                self.mc_last_result = narration
+                if narration:
+                    self._mc_narrate(narration)
+            except numen_bridge.NumenError as exc:
+                now = time.monotonic()
+                if now - self.mc_last_error_ts > 60:
+                    self.mc_last_error_ts = now
+                    self.mc_status.emit(
+                        f"（MC 连不上：{exc}，游戏启动了吗？）"
+                    )
+                brain = None
+            except Exception as exc:
+                now = time.monotonic()
+                if now - self.mc_last_error_ts > 60:
+                    self.mc_last_error_ts = now
+                    self.mc_status.emit(f"（MC 出错了：{exc}）")
+                brain = None
+            try:
+                self.mc_stop.wait(
+                    max(5, int(self.mc_cfg.get("loop_interval_seconds", 8)))
+                )
+            except Exception:
+                break
 
     def _request_screen_shot(self):
         """请求界面线程截屏并等待结果（语音对话线程不能直接操作界面）。"""
@@ -4616,6 +5062,21 @@ class PetWindow(QWidget):
             menu.addAction(
                 QAction("聊天设置…", self, triggered=self.open_chat_settings)
             )
+            mc_menu = _new_menu("Minecraft 游戏（Numen）", menu)
+            menu.addMenu(mc_menu)
+            mc_toggle = QAction("开启 Yumi 玩 MC", self, checkable=True)
+            mc_toggle.setChecked(bool(self.mc_cfg.get("enabled")))
+            mc_toggle.triggered.connect(self.set_mc_enabled)
+            mc_menu.addAction(mc_toggle)
+            mc_menu.addAction(
+                QAction("MC 设置…", self, triggered=self.open_mc_settings)
+            )
+            mc_menu.addAction(
+                QAction("让它去玩一下", self, triggered=self.mc_play_now)
+            )
+            mc_menu.addAction(
+                QAction("停止当前行动", self, triggered=self.mc_stop_now)
+            )
             memory_menu = _new_menu("记忆", menu)
             menu.addMenu(memory_menu)
             memory_toggle = QAction("开启记忆", self, checkable=True)
@@ -4853,6 +5314,10 @@ class PetWindow(QWidget):
             with open(DISABLED_FLAG, "w", encoding="utf-8") as f:
                 f.write("1")
         except OSError:
+            pass
+        try:
+            self.mc_stop.set()
+        except Exception:
             pass
         try:
             self.soullink_runner.stop()

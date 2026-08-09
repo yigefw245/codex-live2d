@@ -11,6 +11,18 @@
     "probability": 70,
     "min_interval_minutes": 3
   },
+  "minecraft": {
+    "enabled": false,
+    "host": "127.0.0.1",
+    "port": 8765,
+    "companion": "yumi",
+    "goal": "自由探索当前世界：挖点有用的矿物（铁、煤），注意安全别掉进岩浆，顺便看看周围有什么有趣的东西。",
+    "loop_enabled": true,
+    "narration": true,
+    "loop_interval_seconds": 8,
+    "max_actions_per_turn": 5,
+    "call_timeout_seconds": 300
+  },
   "voice_input": {
     "enabled": false,
     "model": "small",
