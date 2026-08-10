@@ -11,6 +11,7 @@ Numen 模组会在游戏里开一个 MCP 服务（默认 http://127.0.0.1:8765/m
 """
 
 import json
+import re
 import threading
 import time
 import urllib.error
@@ -27,7 +28,24 @@ PLANNER_SYSTEM = (
     "3. 任务要在几分钟内能完成或能判断出结果，不要规划「建一座城堡」这种大工程；\n"
     "4. 优先选择能推进长期目标、且当前状态允许的事；\n"
     "5. 如果当前状态危险（血量低、在岩浆边等），先规划保命或恢复；\n"
-    "6. 任务量要小：采集类（挖矿/收集）一次不超过 5 个，避免长时间来回跑动。"
+    "6. 任务量要小：采集类（挖矿/收集）一次不超过 5 个，避免长时间来回跑动；\n"
+    "7. 先看背包材料数量：采集类材料已经足够时（原木≥20、圆石≥32），"
+    "改规划建造/加工（合成木板、铺地基、砌墙），不要重复采集。"
+)
+
+DEFAULT_MC_KNOWLEDGE = (
+    "【工具】挖石头/圆石不需要镐但有镐更快；挖铁矿石至少需要石镐，"
+    "挖钻石/红石需要铁镐。先做工作台和木镐，再升级石镐、铁镐。\n"
+    "【掉落】挖 minecraft:stone 掉 cobblestone（圆石），圆石本身不是矿脉；"
+    "挖 iron_ore/deepslate_iron_ore 掉 raw_iron，粗铁要熔炉烧成铁锭；"
+    "挖 coal_ore 掉 coal；挖 oak_log 等掉原木。\n"
+    "【建造】盖房子顺序：铺地基（圆石/木板）→ 砌墙留门洞 → 安门 → 封顶 → 插火把。"
+    "材料够用就停手去建造，别无限采集；先盖小再扩大。\n"
+    "【合成】原木→木板；木板+木棍→镐/斧/剑；先做工作台，再合成熔炉，"
+    "熔炉烧粗铁得铁锭。\n"
+    "【安全】绝对不要垂直往下挖（会掉岩浆/深坑），下矿先挖阶梯；"
+    "血量低别打怪，被追先跑或搭高；离岩浆远点；黑暗处插火把防刷怪；"
+    "饿了吃背包食物；工具快坏先修或换。"
 )
 
 
@@ -212,12 +230,16 @@ class NumenClient:
 class McBrain:
     """桌宠大脑 + Numen 工具的执行循环。"""
 
-    def __init__(self, numen, llm_complete, cfg=None, persona=""):
+    def __init__(self, numen, llm_complete, cfg=None, persona="",
+                 extra_knowledge=""):
         self.numen = numen
         # llm_complete(messages, tools=None) -> {"content": str, "tool_calls": [...]}
         self.llm_complete = llm_complete
         self.cfg = cfg or {}
         self.persona = str(persona or "")
+        self.mc_knowledge = str(extra_knowledge or "").strip() or (
+            DEFAULT_MC_KNOWLEDGE
+        )
         self._tools = None
         self._companion = None
         self._abort = threading.Event()
@@ -270,8 +292,8 @@ class McBrain:
 
     # ---------- 决策循环 ----------
 
-    def status_snapshot(self, max_len=600):
-        """读取当前状态摘要，给规划层做输入；失败返回 None。"""
+    def status_snapshot(self, max_len=900):
+        """读取当前状态摘要（含背包统计），给规划层做输入；失败返回 None。"""
         if not self._companion:
             return None
         try:
@@ -280,21 +302,100 @@ class McBrain:
                 {"companion": self._companion},
                 timeout=30,
             )
-            return str(raw)[:max_len]
         except Exception:
             return None
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return str(raw)[:max_len]
+        if not isinstance(data, dict):
+            return str(raw)[:max_len]
+        parts = []
+        if data.get("name"):
+            parts.append(f"名字:{data['name']}")
+        if data.get("game_mode"):
+            parts.append(f"模式:{data['game_mode']}")
+        if data.get("hp") is not None:
+            parts.append(f"血量:{data['hp']}/{data.get('max_hp')}")
+        if data.get("hunger") is not None:
+            parts.append(f"饥饿:{data['hunger']}")
+        pos = data.get("position")
+        if isinstance(pos, dict):
+            parts.append(
+                f"位置:({pos.get('x')},{pos.get('y')},{pos.get('z')})"
+            )
+        if data.get("dimension"):
+            parts.append(
+                "维度:" + str(data["dimension"]).replace("minecraft:", "")
+            )
+        if data.get("biome"):
+            parts.append("群系:" + str(data["biome"]).replace("minecraft:", ""))
+        if data.get("structures"):
+            names = [
+                str(s).replace("minecraft:", "")
+                for s in data["structures"]
+            ]
+            parts.append("所在建筑:" + ",".join(names))
+        inventory = data.get("inventory") or {}
+        items = inventory.get("items") or []
+        counts = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            item_id = str(
+                item.get("id")
+                or item.get("name")
+                or item.get("item")
+                or ""
+            ).replace("minecraft:", "")
+            if not item_id:
+                continue
+            try:
+                count = int(
+                    item.get("count")
+                    or item.get("amount")
+                    or item.get("num")
+                    or 1
+                )
+            except (TypeError, ValueError):
+                count = 1
+            counts[item_id] = counts.get(item_id, 0) + count
+        if counts:
+            inv_text = "、".join(
+                f"{key}×{value}"
+                for key, value in sorted(
+                    counts.items(), key=lambda kv: kv[1], reverse=True
+                )
+            )
+            parts.append(f"背包:{inv_text}")
+        else:
+            parts.append(
+                "背包:空("
+                f"{inventory.get('slots_used', 0)}/"
+                f"{inventory.get('slots_total', 41)}格)"
+            )
+        text = "，".join(parts)
+        return text[:max_len]
 
     def plan_next_task(self, goal, status_note=None, last_task=None,
-                       last_result=None, timeout=30):
+                       last_result=None, timeout=30, user_note=None):
         """规划层：想一个短期任务，返回任务描述（不含工具）。"""
         parts = [f"长期目标：{goal or '自由探索'}"]
         if status_note:
             parts.append(f"当前状态：{status_note}")
+        if user_note:
+            parts.append(
+                f"主人最近说：{user_note}。"
+                "如果这是明确的游戏指令就优先规划它；"
+                "如果只是闲聊，忽略即可。"
+            )
         if last_task:
             parts.append(
                 f"刚才做的：{last_task}（结果：{last_result or '未知'}）。"
                 "不要立刻重复同一件事，除非确实还需要继续。"
             )
+        if self.mc_knowledge:
+            parts.append(f"规划常识（参考）：{self.mc_knowledge}")
         parts.append("现在想一个短期任务：")
         messages = [
             {"role": "system", "content": PLANNER_SYSTEM},
@@ -320,7 +421,8 @@ class McBrain:
             "行动守则：",
             "1. 行动前先感知：用 get_self_status / scan_nearby_entities / scan_blocks"
             " 查看自己的状态和周围环境；",
-            "1b. 不要重复调用相同的感知工具，信息足够就直接行动，减少无谓的来回；",
+            "1b. 观察最多用一轮，信息足够就立刻动手（goto / mine / build / craft），"
+            " 不要反复确认环境；",
             "2. 每次只做一个明确目标，行动后用工具确认结果，再决定下一步；",
             "3. 所有动作工具都带 companion 参数，值为你的伙伴名（从"
             " list_companions / create_companion 得到）；",
@@ -331,9 +433,28 @@ class McBrain:
             " 桥接层会等它完成再把结果给你，不要自己反复调用 task_status 轮询。",
             "7. 如果桥接层告诉你后台任务还在执行，就结束本轮并直接旁白汇报，"
             " 不要重复发送同一个动作。",
+            "8. 绝对不要用文本或 XML 标签（如 <invoke>、<tool_calls>）输出工具调用；"
+            " 工具调用只能通过函数调用机制返回。",
+            "9. 主人说的可能是指令也可能是闲聊：如果是游戏指令就执行；"
+            " 如果只是问候、提问或吐槽，直接正常回应即可，不要调用工具。",
+            "10. 环境检测（get_self_status / scan_* / look_around / inspect_*）"
+            " 只是给你自己看的内部信息，永远不要把它当作旁白说出来；"
+            " 旁白只说你做了什么、完成了什么，不要说“我看到/我确认了周围环境”。",
+            "材料常识（记住，别搞错）：",
+            " - 想获得圆石 cobblestone：挖 minecraft:stone（石头）就会掉；"
+            " 深板岩掉深板岩圆石。cobblestone 本身不是矿脉，不要用 mine 指定它；",
+            " - 原木：挖 oak_log / birch_log / spruce_log 等对应原木；",
+            " - 铁：挖 iron_ore / deepslate_iron_ore 掉 raw_iron（粗铁）；"
+            " 煤：挖 coal_ore 掉 coal；",
+            " - 造房子：原木可以合成木板、木棍；石头/圆石可直接砌墙铺地基；",
+            " - 背包里材料已够（原木≥20、圆石≥32）就停手去建造，不要继续采集；",
+            " - mine 的 count 按“净新增数量”计：包里已有 5 个圆石时，"
+            " 要再挖到新增 5 个才算 count=5 完成。",
         ]
         if goal:
             parts.append(f"你当前的目标：{goal}")
+        if self.mc_knowledge:
+            parts.append(f"《我的世界》生存常识（必须遵守）：\n{self.mc_knowledge}")
         parts.append(
             "当你有值得汇报的进展（或完成了目标）时，用一两句符合你性格的简短中文旁白"
             "总结这一轮做了什么。旁白是给主人听的，20 字左右，口语化，"
@@ -398,6 +519,12 @@ class McBrain:
             response = self.llm_complete(messages, tools=tools or None)
             content = str(response.get("content") or "").strip()
             tool_calls = response.get("tool_calls") or []
+            # 个别模型会把工具调用写成文本（<invoke name="...">...</invoke>），
+            # 一律从内容里剥掉并当作真正的工具调用执行，绝不当作旁白说出来
+            text_calls, cleaned = self._extract_text_tool_calls(content)
+            if text_calls:
+                tool_calls = list(tool_calls) + text_calls
+                content = cleaned.strip()
             if not tool_calls:
                 return content or self._fallback_summary(messages)
             messages.append(
@@ -439,6 +566,61 @@ class McBrain:
             return "（这一轮拖太久了，我先歇会儿）"
         return self._fallback_summary(messages)
 
+    @staticmethod
+    def _extract_text_tool_calls(content):
+        """从文本里解析 <invoke name="tool">...</invoke> 形式的工具调用。
+
+        返回 (tool_calls, 清理后的内容)。解析失败返回 ([], 原内容)。
+        """
+        if not content or "<invoke" not in content.lower():
+            return [], content
+        invoke_re = re.compile(
+            r"<invoke\s+name\s*=\s*[\"']([^\"']+)[\"'][^>]*>"
+            r"(.*?)</invoke>",
+            re.DOTALL | re.IGNORECASE,
+        )
+        param_re = re.compile(
+            r"<parameter\s+name\s*=\s*[\"']([^\"']+)[\"'][^>]*>"
+            r"(.*?)</parameter>",
+            re.DOTALL | re.IGNORECASE,
+        )
+        calls = []
+        cleaned = content
+        index = 0
+        for match in invoke_re.finditer(content):
+            name = match.group(1).strip()
+            body = match.group(2)
+            arguments = {}
+            for p in param_re.finditer(body):
+                key = p.group(1).strip()
+                value = p.group(2).strip()
+                try:
+                    arguments[key] = json.loads(value)
+                except json.JSONDecodeError:
+                    arguments[key] = value
+            index += 1
+            calls.append(
+                {
+                    "id": f"txt_{int(time.time() * 1000)}_{index}",
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(
+                            arguments, ensure_ascii=False
+                        ),
+                    },
+                }
+            )
+        if not calls:
+            return [], content
+        # 清掉 <tool_calls> 包装与代码围栏，只留正文
+        cleaned = invoke_re.sub("", cleaned)
+        cleaned = re.sub(
+            r"</?tool_calls\s*>", "", cleaned, flags=re.IGNORECASE
+        )
+        cleaned = re.sub(r"```[a-zA-Z]*\s*|\s*```", "", cleaned)
+        return calls, cleaned.strip()
+
     def _fallback_summary(self, messages):
         try:
             messages = list(messages)
@@ -460,7 +642,11 @@ class McBrain:
         if not name:
             return "错误：模型没有给出工具名"
         try:
-            if self._companion and "companion" not in arguments:
+            # 伙伴名以桥接层已知的为准，防止模型编造名字（如 yumm）
+            if (
+                self._companion
+                and name not in ("create_companion", "list_companions")
+            ):
                 arguments = dict(arguments)
                 arguments["companion"] = self._companion
             raw = self.numen.call_tool(name, arguments)

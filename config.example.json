@@ -20,7 +20,7 @@
     "loop_enabled": true,
     "narration": true,
     "loop_interval_seconds": 8,
-    "max_actions_per_turn": 5,
+    "max_actions_per_turn": 6,
     "call_timeout_seconds": 300
   },
   "voice_input": {

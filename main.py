@@ -486,7 +486,7 @@ MINECRAFT_DEFAULTS = {
     "loop_enabled": True,
     "narration": True,
     "loop_interval_seconds": 8,
-    "max_actions_per_turn": 5,
+    "max_actions_per_turn": 6,
     "call_timeout_seconds": 300,
 }
 
@@ -2271,7 +2271,7 @@ class MinecraftSettingsDialog(QDialog):
         self.interval_spin.setSuffix(" 秒")
         self.rounds_spin = QSpinBox()
         self.rounds_spin.setRange(2, 30)
-        self.rounds_spin.setValue(int(cfg.get("max_actions_per_turn", 5)))
+        self.rounds_spin.setValue(int(cfg.get("max_actions_per_turn", 6)))
         self.rounds_spin.setSuffix(" 轮")
         self.timeout_spin = QSpinBox()
         self.timeout_spin.setRange(30, 600)
@@ -2292,7 +2292,9 @@ class MinecraftSettingsDialog(QDialog):
         hint = QLabel(
             "前提：游戏已启动并加载 Numen 模组（单人存档或本地服务器均可）。"
             "Yumi 会以“假玩家”身份进入世界，自己感知、决定并执行动作。\n"
-            "聊天或语音里说“去玩mc / 去挖矿 / 去冒险”也会让她立刻行动。"
+            "关闭“自主游玩循环”后进入手动模式：聊天框/语音里说的每句话"
+            "都会直接交给游戏里的 Yumi 执行（如“从树上下来”“跟我来”）。\n"
+            "自主游玩模式下，说“去玩mc / 去挖矿 / 去冒险”等关键词也会触发行动。"
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #888;")
@@ -2715,13 +2717,20 @@ class PetWindow(QWidget):
         self.mc_status.connect(self._notify)
         self.mc_brain = None
         self.mc_stop = threading.Event()
+        self.mc_loop_stop = threading.Event()
+        self.mc_loop_stop.set()
+        self.mc_watch_stop = threading.Event()
+        self.mc_watch_stop.set()
         self.mc_thread = None
+        self.mc_ensure_thread = None
         self.mc_busy = False
+        self.mc_turn_token = 0
         self.mc_turn_lock = threading.Lock()
         self.mc_last_error_ts = 0.0
         self.mc_last_task = None
         self.mc_last_result = None
-        if self.mc_cfg.get("enabled") and self.mc_cfg.get("loop_enabled"):
+        self.mc_last_user_msg = None
+        if self.mc_cfg.get("enabled"):
             QTimer.singleShot(0, lambda: self.set_mc_enabled(True))
         if self.voice_chat_cfg.get("enabled"):
             QTimer.singleShot(
@@ -3144,7 +3153,12 @@ class PetWindow(QWidget):
                 "'（还没有配置聊天接口，请在菜单的 聊天设置 里填写 api_key）', 5000)"
             )
             return
-        if self.mc_cfg.get("enabled") and self._is_mc_request(text):
+        if self.mc_cfg.get("enabled") and not self._is_screen_look_request(
+            text
+        ):
+            # 主人指令最高优先：只要 MC 开着，聊天/语音都按指令处理，
+            # 先记入决策上下文，再立刻打断当前行动去执行
+            self.mc_last_user_msg = text
             self._mc_play_turn(text)
             return
         shot = None
@@ -3190,6 +3204,9 @@ class PetWindow(QWidget):
                     f"（补充信息：我刚刚看了你的屏幕，看到的内容是：{screen_desc}。"
                     "请参考屏幕内容自然回答我的问题，不要提及“看了屏幕”或识图。）"
                 )
+            mc_note = self._mc_context_note()
+            if mc_note:
+                user_content = f"{user_content}\n（背景信息：{mc_note}）"
             # 流式生成 + 逐句朗读（出字就开始 TTS）
             reply, speech_sent = self._stream_chat(
                 history, user_content, memory_note, text
@@ -3974,7 +3991,11 @@ class PetWindow(QWidget):
     def _voice_turn(self, text):
         """处理一句语音：可选读屏 + 聊天 + 记忆 + 气泡 + TTS 朗读。"""
         _voice_chat_diag(f"turn text={text[:40]!r}")
-        if self.mc_cfg.get("enabled") and self._is_mc_request(text):
+        if self.mc_cfg.get("enabled") and not self._is_screen_look_request(
+            text
+        ):
+            # 与聊天一致：语音指令也最高优先，先记入决策上下文再执行
+            self.mc_last_user_msg = text
             self._mc_play_turn(text)
             return
         screen_desc = None
@@ -3996,6 +4017,9 @@ class PetWindow(QWidget):
                 f"（补充信息：我刚刚看了你的屏幕，看到的内容是：{screen_desc}。"
                 "请参考屏幕内容自然回答我的问题，不要提及“看了屏幕”或识图。）"
             )
+        mc_note = self._mc_context_note()
+        if mc_note:
+            user_content = f"{user_content}\n（背景信息：{mc_note}）"
         try:
             history, memory_note = self.memory.dialogue_context(
                 text, history_limit=8
@@ -4102,11 +4126,22 @@ class PetWindow(QWidget):
                 port=int(self.mc_cfg.get("port", 8765)),
                 timeout=int(self.mc_cfg.get("call_timeout_seconds", 300)),
             )
+            knowledge = ""
+            try:
+                knowledge_path = os.path.join(BASE_DIR, "mc_knowledge.md")
+                if os.path.isfile(knowledge_path):
+                    with open(
+                        knowledge_path, encoding="utf-8"
+                    ) as knowledge_file:
+                        knowledge = knowledge_file.read()
+            except Exception:
+                knowledge = ""
             self.mc_brain = numen_bridge.McBrain(
                 numen=numen,
                 llm_complete=self.chat_client.complete,
                 cfg=self.mc_cfg,
                 persona=self.chat_client.persona,
+                extra_knowledge=knowledge,
             )
         return self.mc_brain
 
@@ -4122,21 +4157,47 @@ class PetWindow(QWidget):
         except Exception:
             pass
 
+    def _mc_context_note(self):
+        """普通聊天时告诉她此刻的游戏处境，避免答非所问。"""
+        if not self.mc_cfg.get("enabled"):
+            return ""
+        note = "你此刻正在《我的世界》里，控制着你的角色行动"
+        if self.mc_last_task:
+            note += f"，最近在做：{self.mc_last_task}"
+        if self.mc_last_result:
+            note += f"（{self.mc_last_result}）"
+        return note + "。主人问你话时，请按游戏里的处境回答。"
+
     def set_mc_enabled(self, enabled):
         enabled = bool(enabled)
         self.mc_cfg["enabled"] = enabled
         save_minecraft_config(self.mc_cfg)
         if enabled:
+            self.mc_stop.clear()
             if self.mc_cfg.get("loop_enabled"):
+                self.mc_watch_stop.set()
+                self.mc_loop_stop.clear()
                 if not self.mc_thread or not self.mc_thread.is_alive():
-                    self.mc_stop.clear()
                     self.mc_thread = threading.Thread(
                         target=self._mc_loop, daemon=True
                     )
                     self.mc_thread.start()
-            self.mc_status.emit("已开启 Minecraft：Yumi 去游戏里玩了")
+                self.mc_status.emit("已开启 Minecraft：Yumi 去游戏里玩了")
+            else:
+                self.mc_loop_stop.set()
+                self.mc_watch_stop.clear()
+                if not self.mc_ensure_thread or not self.mc_ensure_thread.is_alive():
+                    self.mc_ensure_thread = threading.Thread(
+                        target=self._mc_watch_companion, daemon=True
+                    )
+                    self.mc_ensure_thread.start()
+                self.mc_status.emit(
+                    "已开启 Minecraft（手动模式）：聊天框里的指令会直接进游戏"
+                )
         else:
             self.mc_stop.set()
+            self.mc_loop_stop.set()
+            self.mc_watch_stop.set()
             self.mc_status.emit("已关闭 Minecraft")
 
     def open_mc_settings(self):
@@ -4154,14 +4215,24 @@ class PetWindow(QWidget):
         self.mc_brain = None
         if was_enabled:
             if new_cfg.get("loop_enabled"):
+                self.mc_watch_stop.set()
+                self.mc_loop_stop.clear()
                 if not self.mc_thread or not self.mc_thread.is_alive():
-                    self.mc_stop.clear()
                     self.mc_thread = threading.Thread(
                         target=self._mc_loop, daemon=True
                     )
                     self.mc_thread.start()
             else:
-                self.mc_stop.set()
+                self.mc_loop_stop.set()
+                self.mc_watch_stop.clear()
+                if (
+                    not self.mc_ensure_thread
+                    or not self.mc_ensure_thread.is_alive()
+                ):
+                    self.mc_ensure_thread = threading.Thread(
+                        target=self._mc_watch_companion, daemon=True
+                    )
+                    self.mc_ensure_thread.start()
         self.mc_status.emit("Minecraft 设置已保存")
 
     def mc_play_now(self):
@@ -4170,6 +4241,7 @@ class PetWindow(QWidget):
 
     def mc_stop_now(self):
         """强制停止当前这一轮 MC 行动（卡住时用）。"""
+        self.mc_turn_token += 1
         self.mc_busy = False
         if self.mc_brain is not None:
             try:
@@ -4179,13 +4251,18 @@ class PetWindow(QWidget):
         self.mc_status.emit("已停止当前 MC 行动")
 
     def _mc_play_turn(self, text):
-        """用户要求时立刻让 Yumi 去 MC 里行动一轮。"""
+        """用户指令最高优先：立刻打断当前行动，执行这一轮。"""
         if not self.mc_cfg.get("enabled"):
             self.mc_status.emit("（Minecraft 还没开启，先到右键菜单开启）")
             return
-        if self.mc_busy:
-            self.mc_status.emit("（Yumi 正在 MC 里忙，等这一轮结束）")
-            return
+        # 新指令优先：先中断正在执行的一轮（含游戏里的后台任务）
+        if self.mc_brain is not None:
+            try:
+                self.mc_brain.abort()
+            except Exception:
+                pass
+        self.mc_turn_token += 1
+        token = self.mc_turn_token
         self.mc_busy = True
 
         def job():
@@ -4196,73 +4273,100 @@ class PetWindow(QWidget):
                     )
                 except Exception:
                     pass
+                if token != self.mc_turn_token:
+                    return
                 brain = self._mc_get_brain()
                 if brain is None:
                     return
                 if self.mc_thread is None or not self.mc_thread.is_alive():
                     brain.ready()
                     brain.ensure_companion(self.mc_cfg.get("companion"))
-                # 上一个后台任务可能还在跑，先等它结束，避免你的指令排队太久
-                if not brain.wait_idle(
-                    timeout=120,
-                    on_progress=lambda msg: self.mc_status.emit(msg),
-                ):
-                    self.mc_status.emit(
-                        "（她还在忙上一件事，先等它结束）"
-                    )
-                # 模糊指令（“去玩mc / 继续玩 / 去冒险”）先让规划层想一个
-                # 短期任务；具体指令（“去挖点铁矿”）直接当作任务执行
+                if token != self.mc_turn_token:
+                    return
+                # 一层思维：直接把你说的当作任务，由同一个大脑想+做
                 status = brain.status_snapshot()
-                task = None
-                t = str(text or "").lower()
-                if any(k in t for k in ("玩mc", "去玩mc", "玩我的世界",
-                                        "去玩我的世界", "我的世界", "minecraft",
-                                        "继续玩", "去冒险", "去探索")):
-                    task = brain.plan_next_task(
-                        text,
-                        status_note=status,
-                        last_task=self.mc_last_task,
-                        last_result=self.mc_last_result,
-                    )
-                    if task and not task.startswith(("（规划", "（连接")):
-                        self.mc_status.emit(f"（想好了：{task}）")
-                    else:
-                        task = None
-                else:
-                    task = text
-                    self.mc_status.emit(f"（收到，这就去：{text[:40]}）")
+                task = text
+                # 上一个后台任务可能还在跑，最多等 30 秒让它收尾，
+                # 避免你的指令在后面排队太久
+                brain.wait_idle(timeout=30)
+                if token != self.mc_turn_token:
+                    return
                 with self.mc_turn_lock:
+                    if token != self.mc_turn_token:
+                        return
                     narration = brain.run_turn(
                         user_goal=text,
                         task=task,
                         status_note=status,
                         max_rounds=int(
-                            self.mc_cfg.get("max_actions_per_turn", 5)
+                            self.mc_cfg.get("max_actions_per_turn", 6)
                         ),
                         turn_timeout=int(
                             self.mc_cfg.get("call_timeout_seconds", 300)
                         ),
-                        on_progress=lambda msg: self.mc_status.emit(msg),
                     )
+                if token != self.mc_turn_token:
+                    return
                 self.mc_last_task = task or text
                 self.mc_last_result = narration
                 if narration:
                     self._mc_narrate(narration)
             except numen_bridge.NumenError as exc:
-                self.mc_status.emit(
-                    f"（MC 连不上：{exc}，游戏启动了吗？）"
-                )
+                if "in a world" in str(exc):
+                    self.mc_status.emit(
+                        "（游戏没进存档：先进到世界，再让我行动）"
+                    )
+                elif "10061" in str(exc) or "积极拒绝" in str(exc):
+                    self.mc_status.emit(
+                        "（MC 连不上：游戏好像没在跑或卡住了，检查一下游戏窗口）"
+                    )
+                else:
+                    self.mc_status.emit(
+                        f"（MC 连不上：{exc}，游戏启动了吗？）"
+                    )
             except Exception as exc:
                 self.mc_status.emit(f"（MC 出错了：{exc}）")
             finally:
-                self.mc_busy = False
+                if token == self.mc_turn_token:
+                    self.mc_busy = False
 
         threading.Thread(target=job, daemon=True).start()
+
+    def _mc_watch_companion(self):
+        """手动模式下也保持伙伴在线：世界一加载就自动召唤。"""
+        last_toast = 0.0
+        while (
+            not self.mc_stop.is_set()
+            and not self.mc_watch_stop.is_set()
+        ):
+            if not self.mc_cfg.get("enabled"):
+                break
+            try:
+                brain = self._mc_get_brain()
+                if brain is not None:
+                    brain.ready()
+                    brain.ensure_companion(self.mc_cfg.get("companion"))
+            except numen_bridge.NumenError:
+                now = time.monotonic()
+                if now - last_toast > 60:
+                    last_toast = now
+                    self.mc_status.emit(
+                        "（Yumi 等游戏进存档，进去我就就位）"
+                    )
+            except Exception:
+                pass
+            try:
+                self.mc_stop.wait(10)
+            except Exception:
+                break
 
     def _mc_loop(self):
         """后台自主游玩循环：连接 -> 确保伙伴 -> 感知/决定/执行 -> 旁白。"""
         brain = None
-        while not self.mc_stop.is_set():
+        while (
+            not self.mc_stop.is_set()
+            and not self.mc_loop_stop.is_set()
+        ):
             if self.mc_busy:
                 try:
                     self.mc_stop.wait(
@@ -4280,40 +4384,28 @@ class PetWindow(QWidget):
                     brain.ensure_companion(self.mc_cfg.get("companion"))
                 # 上一个后台任务可能还在跑（比如挖矿），先等它结束再安排新的，
                 # 避免任务叠加上去让 Yumi 来回跑
-                if not brain.wait_idle(
-                    timeout=120,
-                    on_progress=lambda msg: self.mc_status.emit(msg),
-                ):
-                    self.mc_status.emit(
-                        "（她还在忙上一件事，等它结束再安排）"
-                    )
+                if not brain.wait_idle(timeout=120):
                     continue
                 with self.mc_turn_lock:
-                    # 规划层先想一个短期任务，再交给执行层做
+                    # 一层思维：一个大脑直接感知→决定→执行→汇报
                     status = brain.status_snapshot()
-                    task = brain.plan_next_task(
-                        self.mc_cfg.get("goal") or "",
-                        status_note=status,
-                        last_task=self.mc_last_task,
-                        last_result=self.mc_last_result,
-                    )
-                    if task and not task.startswith(("（规划", "（连接")):
-                        self.mc_status.emit(f"（想好了：{task}）")
-                    else:
-                        task = None
+                    goal = self.mc_cfg.get("goal") or ""
+                    if self.mc_last_user_msg:
+                        goal = (
+                            f"{goal}（主人最近说：{self.mc_last_user_msg}）"
+                        )
                     narration = brain.run_turn(
-                        user_goal=self.mc_cfg.get("goal") or "",
-                        task=task,
+                        user_goal=goal,
+                        task=None,
                         status_note=status,
                         max_rounds=int(
-                            self.mc_cfg.get("max_actions_per_turn", 5)
+                            self.mc_cfg.get("max_actions_per_turn", 6)
                         ),
                         turn_timeout=int(
                             self.mc_cfg.get("call_timeout_seconds", 300)
                         ),
-                        on_progress=lambda msg: self.mc_status.emit(msg),
                     )
-                self.mc_last_task = task
+                self.mc_last_task = goal
                 self.mc_last_result = narration
                 if narration:
                     self._mc_narrate(narration)
@@ -4321,9 +4413,19 @@ class PetWindow(QWidget):
                 now = time.monotonic()
                 if now - self.mc_last_error_ts > 60:
                     self.mc_last_error_ts = now
-                    self.mc_status.emit(
-                        f"（MC 连不上：{exc}，游戏启动了吗？）"
-                    )
+                    if "in a world" in str(exc):
+                        self.mc_status.emit(
+                            "（游戏没进存档：先进到世界，再让我行动）"
+                        )
+                    elif "10061" in str(exc) or "积极拒绝" in str(exc):
+                        self.mc_status.emit(
+                            "（MC 连不上：游戏好像没在跑或卡住了，"
+                            "检查一下游戏窗口）"
+                        )
+                    else:
+                        self.mc_status.emit(
+                            f"（MC 连不上：{exc}，游戏启动了吗？）"
+                        )
                 brain = None
             except Exception as exc:
                 now = time.monotonic()
@@ -5317,6 +5419,8 @@ class PetWindow(QWidget):
             pass
         try:
             self.mc_stop.set()
+            self.mc_loop_stop.set()
+            self.mc_watch_stop.set()
         except Exception:
             pass
         try:
