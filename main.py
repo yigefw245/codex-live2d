@@ -502,7 +502,16 @@ VOICE_INPUT_DEFAULTS = {
 
 VOICE_CHAT_DEFAULTS = {
     "enabled": False,
-    "wake_words": ["yumi", "尤米"],
+    "wake_words": [
+        "yumi",
+        "尤米",
+        "优米",
+        "优咪",
+        "有米",
+        "友米",
+        "you me",
+        "youme",
+    ],
     "silence_seconds": 0.8,
     "idle_timeout_seconds": 60,
     "max_turns": 50,
@@ -1581,6 +1590,11 @@ class LocalVoiceRecognizer:
             language=self.language or "",
             device="cpu",
             compute_type="int8",
+            beam_size=2,
+            silero_sensitivity=0.5,
+            initial_prompt=(
+                "yumi, 优米, 由米, 优咪, 有米, 友米"
+            ),
             spinner=False,
             no_log_file=True,
             ensure_sentence_starting_uppercase=False,
@@ -3156,11 +3170,11 @@ class PetWindow(QWidget):
         if self.mc_cfg.get("enabled") and not self._is_screen_look_request(
             text
         ):
-            # 主人指令最高优先：只要 MC 开着，聊天/语音都按指令处理，
-            # 先记入决策上下文，再立刻打断当前行动去执行
+            # 只有真正的游戏指令才打断；闲聊正常回应、记入决策上下文但不打断
             self.mc_last_user_msg = text
-            self._mc_play_turn(text)
-            return
+            if self._mc_is_command(text):
+                self._mc_play_turn(text)
+                return
         shot = None
         if self._is_screen_look_request(text):
             if not self.vision_client or not self.vision_client.ready():
@@ -3994,10 +4008,11 @@ class PetWindow(QWidget):
         if self.mc_cfg.get("enabled") and not self._is_screen_look_request(
             text
         ):
-            # 与聊天一致：语音指令也最高优先，先记入决策上下文再执行
+            # 语音一致：真指令才打断，闲聊只回应不打断
             self.mc_last_user_msg = text
-            self._mc_play_turn(text)
-            return
+            if self._mc_is_command(text):
+                self._mc_play_turn(text)
+                return
         screen_desc = None
         user_content = text
         if (
@@ -4114,6 +4129,28 @@ class PetWindow(QWidget):
             "继续玩",
         )
         return any(keyword in t for keyword in keywords)
+
+    def _mc_is_command(self, text):
+        """关键词判断一句话是不是真正的游戏指令（避免闲聊也打断她干活）。"""
+        t = str(text or "").lower()
+        hints = (
+            # 移动 / 跟随
+            "回家", "回来", "过来", "跟我", "跟着我", "到我", "过去",
+            "走去", "跑去", "到地上", "从树上", "爬下来", "爬上去",
+            "上去", "去那边",
+            # 挖掘 / 采集
+            "去挖", "挖矿", "挖铁", "挖钻石", "挖煤", "砍树", "砍木",
+            "采石", "挖石头", "挖圆石", "收集", "采集", "捡起来",
+            # 建造 / 加工
+            "建房子", "盖房子", "造房子", "建房", "盖房", "造房", "砌墙",
+            "铺地基", "搭个", "盖个", "建个", "修一下", "做把", "合成", "装备",
+            # 停手
+            "停下", "住手", "别挖", "别砍", "别建", "别动", "别打",
+            "先停", "停一下",
+            # 生活 / 睡眠
+            "睡觉", "睡吧", "去睡",
+        )
+        return any(hint in t for hint in hints)
 
     def _mc_get_brain(self):
         """构造（或复用）MC 大脑；聊天接口不可用时返回 None。"""

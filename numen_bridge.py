@@ -568,20 +568,23 @@ class McBrain:
 
     @staticmethod
     def _extract_text_tool_calls(content):
-        """从文本里解析 <invoke name="tool">...</invoke> 形式的工具调用。
+        """从文本里解析工具调用（兼容 <invoke> 与带前缀的 <...>invoke 形式）。
 
         返回 (tool_calls, 清理后的内容)。解析失败返回 ([], 原内容)。
         """
-        if not content or "<invoke" not in content.lower():
+        if not content or "<" not in content:
             return [], content
+        tag_open = r"<(?:[^>]*>)?"
         invoke_re = re.compile(
-            r"<invoke\s+name\s*=\s*[\"']([^\"']+)[\"'][^>]*>"
-            r"(.*?)</invoke>",
+            tag_open
+            + r"invoke\s+name\s*=\s*[\"']([^\"']+)[\"'][^>]*>"
+            + r"(.*?)</(?:[^>]*>)?invoke\s*>",
             re.DOTALL | re.IGNORECASE,
         )
         param_re = re.compile(
-            r"<parameter\s+name\s*=\s*[\"']([^\"']+)[\"'][^>]*>"
-            r"(.*?)</parameter>",
+            tag_open
+            + r"parameter\s+name\s*=\s*[\"']([^\"']+)[\"'][^>]*>"
+            + r"(.*?)</(?:[^>]*>)?parameter\s*>",
             re.DOTALL | re.IGNORECASE,
         )
         calls = []
@@ -616,7 +619,7 @@ class McBrain:
         # 清掉 <tool_calls> 包装与代码围栏，只留正文
         cleaned = invoke_re.sub("", cleaned)
         cleaned = re.sub(
-            r"</?tool_calls\s*>", "", cleaned, flags=re.IGNORECASE
+            r"</?(?:[^>]*>)?tool_calls\s*>", "", cleaned, flags=re.IGNORECASE
         )
         cleaned = re.sub(r"```[a-zA-Z]*\s*|\s*```", "", cleaned)
         return calls, cleaned.strip()
