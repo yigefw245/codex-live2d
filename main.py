@@ -2739,6 +2739,7 @@ class PetWindow(QWidget):
         self.mc_ensure_thread = None
         self.mc_busy = False
         self.mc_turn_token = 0
+        self.mc_paused = False
         self.mc_turn_lock = threading.Lock()
         self.mc_last_error_ts = 0.0
         self.mc_last_task = None
@@ -4146,11 +4147,26 @@ class PetWindow(QWidget):
             "铺地基", "搭个", "盖个", "建个", "修一下", "做把", "合成", "装备",
             # 停手
             "停下", "住手", "别挖", "别砍", "别建", "别动", "别打",
-            "先停", "停一下",
+            "先停", "停一下", "不要动", "别乱动", "站着别动", "原地",
+            "待命", "站住",
             # 生活 / 睡眠
             "睡觉", "睡吧", "去睡",
         )
-        return any(hint in t for hint in hints)
+        return t.startswith("停") or any(hint in t for hint in hints)
+
+    @staticmethod
+    def _is_stop_command(text):
+        """判断一句话是否是“停下来/别动”类指令。"""
+        t = str(text or "").strip().lower()
+        if t.startswith("停"):
+            return True
+        for hint in (
+            "不要动", "别动", "别乱动", "站着别动", "原地", "待命",
+            "住手", "站住", "先停",
+        ):
+            if hint in t:
+                return True
+        return False
 
     def _mc_get_brain(self):
         """构造（或复用）MC 大脑；聊天接口不可用时返回 None。"""
@@ -4205,12 +4221,30 @@ class PetWindow(QWidget):
             note += f"（{self.mc_last_result}）"
         return note + "。主人问你话时，请按游戏里的处境回答。"
 
+    def _mc_recent_history(self, limit=6):
+        """最近几条 MC 行动记录（帮她记住建房位置和进度）。"""
+        try:
+            entries = self.memory.short_term_entries()
+        except Exception:
+            return ""
+        lines = []
+        for item in entries:
+            if (
+                item.get("source") == "mc"
+                and item.get("speaker") == "assistant"
+            ):
+                content = str(item.get("content") or "").strip()
+                if content and not content.startswith("（这一轮"):
+                    lines.append(content)
+        return "\n".join(lines[-limit:])
+
     def set_mc_enabled(self, enabled):
         enabled = bool(enabled)
         self.mc_cfg["enabled"] = enabled
         save_minecraft_config(self.mc_cfg)
         if enabled:
             self.mc_stop.clear()
+            self.mc_paused = False
             if self.mc_cfg.get("loop_enabled"):
                 self.mc_watch_stop.set()
                 self.mc_loop_stop.clear()
@@ -4292,6 +4326,20 @@ class PetWindow(QWidget):
         if not self.mc_cfg.get("enabled"):
             self.mc_status.emit("（Minecraft 还没开启，先到右键菜单开启）")
             return
+        # “停/别动”类指令：真正停下来，暂停自动循环，不再重复念叨
+        if self._is_stop_command(text):
+            self.mc_last_user_msg = None
+            if self.mc_brain is not None:
+                try:
+                    self.mc_brain.abort()
+                except Exception:
+                    pass
+            self.mc_paused = True
+            self.mc_turn_token += 1
+            self.mc_busy = False
+            self.mc_status.emit("（好，停下了，原地待命，等你指令）")
+            return
+        self.mc_paused = False
         # 新指令优先：先中断正在执行的一轮（含游戏里的后台任务）
         if self.mc_brain is not None:
             try:
@@ -4323,6 +4371,15 @@ class PetWindow(QWidget):
                 # 一层思维：直接把你说的当作任务，由同一个大脑想+做
                 status = brain.status_snapshot()
                 task = text
+                goal_text = text
+                history = self._mc_recent_history()
+                if history:
+                    goal_text = (
+                        f"{text}\n"
+                        "你最近的行动记录（继续当前建造/任务时参考，"
+                        "别重复或换位置）：\n"
+                        f"{history}"
+                    )
                 # 上一个后台任务可能还在跑，最多等 30 秒让它收尾，
                 # 避免你的指令在后面排队太久
                 brain.wait_idle(timeout=30)
@@ -4332,7 +4389,7 @@ class PetWindow(QWidget):
                     if token != self.mc_turn_token:
                         return
                     narration = brain.run_turn(
-                        user_goal=text,
+                        user_goal=goal_text,
                         task=task,
                         status_note=status,
                         max_rounds=int(
@@ -4412,6 +4469,14 @@ class PetWindow(QWidget):
                 except Exception:
                     break
                 continue
+            if self.mc_paused:
+                try:
+                    self.mc_stop.wait(
+                        max(5, int(self.mc_cfg.get("loop_interval_seconds", 8)))
+                    )
+                except Exception:
+                    break
+                continue
             try:
                 if brain is None:
                     brain = self._mc_get_brain()
@@ -4431,8 +4496,19 @@ class PetWindow(QWidget):
                         goal = (
                             f"{goal}（主人最近说：{self.mc_last_user_msg}）"
                         )
+                    run_goal = goal
+                    history = self._mc_recent_history()
+                    if history:
+                        run_goal = (
+                            f"{goal}\n"
+                            "你最近的行动记录（继续当前建造/任务时参考，"
+                            "别重复或换位置）：\n"
+                            f"{history}"
+                        )
+                    # 主人消息用过一次就清掉，避免每轮重复念叨
+                    self.mc_last_user_msg = None
                     narration = brain.run_turn(
-                        user_goal=goal,
+                        user_goal=run_goal,
                         task=None,
                         status_note=status,
                         max_rounds=int(
