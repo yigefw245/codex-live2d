@@ -37,7 +37,29 @@ class SoullinkRunner:
         self._log_cursor = 0
 
     def node_path(self):
-        return shutil.which("node")
+        found = shutil.which("node")
+        if found:
+            return found
+        # 兜底：用户级 Node 安装位置，避免 PATH 未刷新/被重置时找不到 Node。
+        for candidate in (
+            os.path.join(
+                os.environ.get("LOCALAPPDATA", ""),
+                "Programs",
+                "nodejs",
+                "node.exe",
+            ),
+            os.path.join(
+                os.path.expanduser("~"),
+                "AppData",
+                "Local",
+                "Programs",
+                "nodejs",
+                "node.exe",
+            ),
+        ):
+            if candidate and os.path.isfile(candidate):
+                return candidate
+        return None
 
     def start(self, cfg):
         """启动侧服务。cfg 为读屏幕/聊天之外的 soullink 配置（embedding/tts）。"""

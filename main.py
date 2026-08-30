@@ -121,7 +121,8 @@ def model_actions(settings, model_id):
 
 def sanitize_model_id(name):
     name = str(name or "").strip()
-    cleaned = re.sub(r"[^A-Za-z0-9_-]", "", name)
+    # 保留中文等 Unicode 字母，避免“悠小喵”被清空成 “model” 导致 id 冲突
+    cleaned = re.sub(r"[^\w-]", "", name)
     return cleaned or "model"
 
 
@@ -221,6 +222,93 @@ def _model3_expression_entries(expressions):
         for name in name_map.get(key, [key]):
             entries.append({"Name": name, "File": file})
     return entries
+
+
+def _fix_model3_paths(model_dir, model3_rel):
+    """修正 model3.json 中引用文件与实际解压位置不一致的问题。
+
+    有些模型包把纹理等放在子目录里（如 悠小喵.8192/texture_00.png），但压缩包
+    实际解压后平铺在模型根目录；pixi-live2d-display 会按说明文件里的路径去加载，
+    路径对不上就会 404，导致 Live2D 模型整只加载失败、角色消失。这里按文件名
+    找回真实文件并改写路径；若所有引用都能解析到文件，则不修改。
+    """
+    m3_path = os.path.join(model_dir, model3_rel)
+    try:
+        with open(m3_path, encoding="utf-8") as f:
+            m3 = json.load(f)
+    except Exception:
+        return False
+
+    # 建立 basename -> 真实相对路径 索引，用于按文件名找回位置
+    file_index = {}
+    for root, _dirs, files in os.walk(model_dir):
+        for fname in files:
+            rel = os.path.relpath(os.path.join(root, fname), model_dir)
+            rel = rel.replace("\\", "/")
+            file_index.setdefault(fname, rel)
+
+    def fix_ref(ref):
+        if not isinstance(ref, str):
+            return ref
+        r = ref.replace("\\", "/")
+        if os.path.exists(os.path.join(model_dir, r)):
+            return r
+        base = os.path.basename(r)
+        if base in file_index and file_index[base] != r:
+            return file_index[base]
+        return r
+
+    changed = False
+    fr = m3.get("FileReferences")
+    if isinstance(fr, dict):
+        for key in ("Moc", "Physics", "DisplayInfo"):
+            if isinstance(fr.get(key), str):
+                fixed = fix_ref(fr[key])
+                if fixed != fr[key]:
+                    fr[key] = fixed
+                    changed = True
+        if isinstance(fr.get("Textures"), list):
+            fixed = [fix_ref(t) for t in fr["Textures"]]
+            if fixed != fr["Textures"]:
+                fr["Textures"] = fixed
+                changed = True
+        if isinstance(fr.get("Expressions"), list):
+            fixed = []
+            for e in fr["Expressions"]:
+                if isinstance(e, dict) and isinstance(e.get("File"), str):
+                    nf = fix_ref(e["File"])
+                    if nf != e["File"]:
+                        e = dict(e)
+                        e["File"] = nf
+                        changed = True
+                fixed.append(e)
+            fr["Expressions"] = fixed
+
+    for e in m3.get("Expressions") or []:
+        if isinstance(e, dict) and isinstance(e.get("File"), str):
+            nf = fix_ref(e["File"])
+            if nf != e["File"]:
+                e["File"] = nf
+                changed = True
+
+    mot = m3.get("Motions")
+    if isinstance(mot, dict):
+        for items in mot.values():
+            if isinstance(items, list):
+                for it in items:
+                    if isinstance(it, dict) and isinstance(it.get("File"), str):
+                        nf = fix_ref(it["File"])
+                        if nf != it["File"]:
+                            it["File"] = nf
+                            changed = True
+
+    if changed:
+        try:
+            with open(m3_path, "w", encoding="utf-8") as f:
+                json.dump(m3, f, ensure_ascii=False, indent=1)
+        except Exception:
+            return False
+    return changed
 
 
 def build_model_config(model_dir, model3_rel, display_name, model_id):
@@ -2769,6 +2857,11 @@ class PetWindow(QWidget):
         settings.setAttribute(
             QWebEngineSettings.LocalContentCanAccessRemoteUrls, True
         )
+        # 允许 TTS / 朗读在无用户点击手势时自动播放；
+        # 否则 QtWebEngine 默认拦截自动播放，会导致「有文字、没声音」。
+        settings.setAttribute(
+            QWebEngineSettings.PlaybackRequiresUserGesture, False
+        )
         self.channel = QWebChannel(self.view.page())
         self.channel.registerObject("pet", self.bridge)
         self.view.page().setWebChannel(self.channel)
@@ -3083,6 +3176,8 @@ class PetWindow(QWidget):
             shutil.rmtree(dest, ignore_errors=True)
             self._notify("导入失败：未找到 model3.json")
             return
+        # 先修正 model3.json 里与实际解压位置不一致的文件路径（如纹理子目录）
+        _fix_model3_paths(dest, model3_rel)
         try:
             cfg, _patched = build_model_config(
                 dest, model3_rel, display_name, model_id
