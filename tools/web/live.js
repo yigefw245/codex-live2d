@@ -44,6 +44,9 @@ let recZ = 0;
 let soullinkActions = null;
 let speakQueue = Promise.resolve();
 let speakPending = 0;
+let speechGeneration = 0;
+let speechError = "";
+let speechCount = 0;
 let soullink = { enabled: false, config: null, bridge: null, starting: null };
 
 function soullinkEnabled() {
@@ -614,13 +617,20 @@ window.soullinkRestart = async () => {
 
 window.soullinkChat = (payload) => {
   if (!payload) return;
+  if (payload.generation != null && payload.generation < speechGeneration) return;
   if (!soullinkEnabled() || !soullink.bridge) {
     if (payload.reply) showChatReply(payload.reply, 6000);
+    window.soullinkSpeak(payload.speak_text || payload.reply || "", payload.generation);
     return;
   }
   const intent = payload.intent || null;
   // 实时语音对话（no_bubble）不显示文字气泡，其余照常显示
   if (payload.reply && !payload.no_bubble) showChatReply(payload.reply, 6000);
+  window.soullinkSpeak(payload.speak_text || payload.reply || "",
+                      payload.generation, {
+                        emotion: intent?.naturalEmotion || intent?.emotion,
+                        vad: intent?.naturalVAD, intent
+                      });
   if (intent) {
     // 有情绪反应/说话时，让 SDK 表情接管，取消手势姿势及其恢复计时
     clearPose();
@@ -635,54 +645,74 @@ window.soullinkChat = (payload) => {
     if (!repeat) {
       lastReactEmotion = emotionKey;
       lastReactAt = now;
-      soullink.bridge.react(intent);
-    }
-    let speakPromise;
-    try {
-      speakPromise = soullink.bridge.speak({
-        text: payload.speak_text || payload.reply || "",
-        emotion: intent.naturalEmotion || intent.emotion,
-        vad: intent.naturalVAD,
-        intent
-      });
-    } catch (err) {
-      speakPromise = Promise.resolve();
-    }
-    Promise.resolve(speakPromise).finally(() => {
-      // 朗读结束（无论成败）通知 Python，用于语音对话期间恢复麦克风
-      if (window.__bridge && window.__bridge.tts_played) {
-        window.__bridge.tts_played();
+      try {
+        soullink.bridge.react(intent);
+      } catch (error) {
+        console.error("[soullink] reaction failed", error);
       }
-    });
+    }
   }
 };
 
 // 流式朗读：逐句排队播放（上一句播完才播下一句），全部播完通知 Python。
-window.soullinkSpeak = (text) => {
-  if (!soullinkEnabled() || !soullink.bridge) return;
+window.soullinkSpeak = (text, generation = speechGeneration, options = {}) => {
+  if (generation == null) generation = speechGeneration;
+  if (generation < speechGeneration) return;
+  if (generation > speechGeneration) window.stopSpeech(generation);
   const t = String(text || "");
   if (!t.trim()) return;
+  speechCount += 1;
   speakPending += 1;
   speakQueue = speakQueue
-    .then(() =>
-      soullink.bridge.speak({
+    .then(() => {
+      if (generation !== speechGeneration) return;
+      if (!soullinkEnabled() || !soullink.bridge) {
+        throw new Error("Speech service is not ready");
+      }
+      return soullink.bridge.speak({
         text: t,
         emotion: "neutral",
         vad: null,
-        intent: null
-      })
-    )
-    .catch(() => {})
+        intent: null,
+        ...options
+      });
+    })
+    .catch(error => {
+      if (generation === speechGeneration) {
+        speechError = String(error?.message || error || "Speech failed");
+        console.error("[speech] playback failed", error);
+      }
+    })
     .finally(() => {
+      if (generation !== speechGeneration) return;
       speakPending -= 1;
-      if (
-        speakPending === 0 &&
-        window.__bridge &&
-        window.__bridge.tts_played
-      ) {
+    });
+};
+
+window.finishSpeech = (generation = speechGeneration) => {
+  if (generation == null) generation = speechGeneration;
+  const pending = speakQueue;
+  pending.finally(() => {
+    if (generation === speechGeneration) {
+      const error = speechError || (speechCount ? "" : "No speech was queued");
+      speechError = "";
+      speechCount = 0;
+      if (window.__bridge?.tts_result) {
+        window.__bridge.tts_result(generation, error);
+      } else if (!error && window.__bridge?.tts_played) {
         window.__bridge.tts_played();
       }
-    });
+    }
+  });
+};
+
+window.stopSpeech = (generation = speechGeneration + 1) => {
+  speechGeneration = Math.max(speechGeneration, generation);
+  speakQueue = Promise.resolve();
+  speakPending = 0;
+  speechError = "";
+  speechCount = 0;
+  soullink.bridge?.stopVoice();
 };
 
 // 流式结束后的情绪反应：只做表情/气泡，不再重复朗读。
@@ -1127,6 +1157,7 @@ window.setPetState = setPetState;
 window.setExpression = setExpression;
 window.setChatMode = setChatMode;
 window.showChatReply = showChatReply;
+window.notify = showBubble;
 window.chatReact = chatReact;
 
 // 动作幅度（0.5x - 2x）：内置动作引擎的摇晃/姿态统一按此放大。
@@ -1171,7 +1202,10 @@ const chatMicEl = document.getElementById("chat-mic");
 
 window.setVoiceInputEnabled = (on, keyLabel) => {
   chatMicEl.classList.toggle("show", !!on);
-  if (!on) chatMicEl.classList.remove("recording");
+  if (!on) {
+    window.setVoiceRecording(false);
+    window.setVoiceBusy(false);
+  }
   chatMicEl.title = keyLabel
     ? `按住 ${keyLabel} 说话，松开发送（或点击录音）`
     : "语音输入";
@@ -1179,6 +1213,14 @@ window.setVoiceInputEnabled = (on, keyLabel) => {
 
 window.setVoiceRecording = (on) => {
   chatMicEl.classList.toggle("recording", !!on);
+  chatMicEl.setAttribute("aria-pressed", String(!!on));
+};
+
+window.setVoiceBusy = (on, label) => {
+  chatMicEl.disabled = !!on;
+  chatMicEl.classList.toggle("busy", !!on);
+  chatMicEl.setAttribute("aria-busy", String(!!on));
+  if (label) chatMicEl.title = label;
 };
 
 window.setVoiceText = (text) => {
@@ -1193,6 +1235,12 @@ chatMicEl.addEventListener("click", () => {
 });
 
 document.getElementById("chat-send").addEventListener("click", sendChat);
+document.getElementById("chat-stop").addEventListener("click", () => {
+  window.__bridge?.stop_reply();
+});
+window.setDialogueBusy = (busy) => {
+  document.getElementById("chat-stop").disabled = !busy;
+};
 chatInputEl.addEventListener("keydown", (e) => {
   if (e.key === "Enter") sendChat();
 });
