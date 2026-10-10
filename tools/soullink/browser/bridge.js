@@ -8,10 +8,10 @@ import {
   motionStylePresets
 } from "@soullink-emotion/engine";
 import {
-  createBrowserAudioSink,
   createRafClock,
   createSoullinkSession
 } from "@soullink-emotion/runtime-core";
+import {createPetAudioSink} from "./audio.js";
 
 let session = null;
 let modelRef = null;
@@ -20,6 +20,7 @@ let started = false;
 let paramsHookAttached = false;
 let headTiltGain = 1;
 let poseKeys = null;
+let voiceError = "";
 
 function applyParamsHook() {
   const core = modelRef?.internalModel?.coreModel;
@@ -152,7 +153,7 @@ async function start(config) {
       variantByEmotion: {}
     },
     clock: createRafClock(),
-    audio: createBrowserAudioSink(),
+    audio: createPetAudioSink(error => { voiceError = error.message; }),
     tts: {
       async synthesize(text, ctx) {
         const response = await fetch(config.ttsUrl, {
@@ -186,6 +187,9 @@ async function start(config) {
     },
     motionStyle: style,
     onSnapshot(snapshot) {
+      if (snapshot?.voiceStatus === "error") {
+        voiceError = snapshot.apiError || "Speech synthesis failed";
+      }
       if (snapshot?.runtime) applyNativeAnimation(snapshot.runtime);
     }
   });
@@ -197,7 +201,7 @@ async function start(config) {
   session.setBodyMotionGain(
     Math.min(4, Math.max(0, Number(config.bodyMotionGain) || 2.8))
   );
-  if (typeof config.lipSyncGain === "number") {
+  if (typeof config.lipSyncGain === "number" && typeof session.setLipSyncGain === "function") {
     session.setLipSyncGain(config.lipSyncGain);
   }
   session.start();
@@ -224,17 +228,19 @@ function react(intent) {
   session.triggerIntent(intent);
 }
 
-function speak(payload) {
-  if (!session || !payload || !payload.text) return Promise.resolve();
-  return session
-    .speak({
+async function speak(payload) {
+  if (!session || !payload || !payload.text) throw new Error("Speech service is not ready");
+  const speakingSession = session;
+  voiceError = "";
+  await speakingSession.speak({
       text: payload.text,
       emotion: payload.emotion,
       vad: payload.vad,
       intent: payload.intent || null,
-      planSpeakingMotion: false
-    })
-    .catch(() => {});
+      planSpeakingMotion: false,
+      force: true
+    });
+  if (session === speakingSession && voiceError) throw new Error(voiceError);
 }
 
 function stopVoice() {

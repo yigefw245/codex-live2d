@@ -11,11 +11,14 @@
 """
 
 import json
+from collections import deque
+import copy
 import os
 import re
 import threading
 import time
 import urllib.request
+import uuid
 from datetime import datetime
 
 MIN_EXTRACT_INTERVAL = 15  # 两次长期记忆提炼之间的最短秒数，避免高频对话时反复调用模型
@@ -94,18 +97,34 @@ class _EmbeddingClient:
 class PetMemory:
     """桌宠本地记忆：短期对话流水 + 长期事实库。"""
 
-    def __init__(self, cfg, base_dir):
+    def __init__(self, cfg, base_dir, diagnostics=None):
         self.cfg = dict(cfg or {})
         self.enabled = bool(self.cfg.get("enabled", True))
         self.memory_dir = os.path.join(base_dir, "memory")
         self.short_path = os.path.join(self.memory_dir, "short_term.jsonl")
         self.long_path = os.path.join(self.memory_dir, "long_term.json")
-        self._lock = threading.Lock()
+        self.summary_path = os.path.join(self.memory_dir, "summary.json")
+        self.diagnostics = diagnostics
+        self._lock = threading.RLock()
+        self._persist_lock = threading.RLock()
+        self._work = threading.Condition()
+        self._pending = deque()
+        self._closed = False
+        self._generation = 0
         self._embed = _EmbeddingClient(self.cfg.get("embedding") or {})
         self._embed_ok = self._embed.ready()
+        self._embedding_retry_at = 0.0
         self._last_extract_ts = 0.0
         self.short_term = self._load_short_term()
         self.long_term = self._load_long_term()
+        try:
+            with open(self.summary_path, encoding="utf-8") as stream:
+                self.summary = str(json.load(stream).get("summary") or "")
+        except (OSError, ValueError, AttributeError):
+            self.summary = ""
+        self._worker = threading.Thread(target=self._memory_worker, daemon=True,
+                                        name="pet-memory")
+        self._worker.start()
 
     # ---------- 通用参数 ----------
 
@@ -163,13 +182,27 @@ class PetMemory:
         return self._prune_short(items)
 
     def _save_short_term(self):
+        self._save_snapshot(self.short_path, "short_term", jsonl=True)
+
+    def _save_snapshot(self, path, attribute, jsonl=False):
         try:
-            os.makedirs(self.memory_dir, exist_ok=True)
-            with open(self.short_path, "w", encoding="utf-8") as f:
-                for item in self.short_term:
-                    f.write(json.dumps(item, ensure_ascii=False) + "\n")
-        except Exception:
-            pass
+            with self._persist_lock:
+                with self._lock:
+                    data = copy.deepcopy(getattr(self, attribute))
+                os.makedirs(self.memory_dir, exist_ok=True)
+                tmp = path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as stream:
+                    if jsonl:
+                        for item in data:
+                            stream.write(json.dumps(item, ensure_ascii=False) + "\n")
+                    else:
+                        if attribute == "summary":
+                            data = {"summary": data}
+                        json.dump(data, stream, ensure_ascii=False, indent=2)
+                os.replace(tmp, path)
+        except OSError as exc:
+            if self.diagnostics:
+                self.diagnostics.event("memory.persist_error", error=type(exc).__name__)
 
     def short_term_entries(self):
         with self._lock:
@@ -212,6 +245,7 @@ class PetMemory:
         if not self.enabled:
             return
         with self._lock:
+            generation = self._generation
             self.short_term.append(
                 {
                     "ts": _now_ts(),
@@ -235,7 +269,11 @@ class PetMemory:
             and chat_client is not None
             and self.cfg.get("long_term_extract", True)
         ):
-            self._extract(chat_client, user_text, reply)
+            with self._work:
+                if not self._closed:
+                    self._pending.append((chat_client, user_text, reply, source,
+                                          generation))
+                    self._work.notify()
 
     # ---------- 长期记忆 ----------
 
@@ -256,16 +294,11 @@ class PetMemory:
             return []
 
     def _save_long_term(self):
-        try:
-            os.makedirs(self.memory_dir, exist_ok=True)
-            with open(self.long_path, "w", encoding="utf-8") as f:
-                json.dump(self.long_term, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
+        self._save_snapshot(self.long_path, "long_term")
 
     def long_term_entries(self):
         with self._lock:
-            return list(self.long_term)
+            return copy.deepcopy(self.long_term)
 
     def _similarity(self, a, b):
         """两条事实的相似度：优先用向量，其次本地 n-gram。"""
@@ -278,41 +311,39 @@ class PetMemory:
         text_b = b if isinstance(b, str) else b.get("content", "")
         return _jaccard(text_a, text_b)
 
-    def _merge_fact(self, content, importance):
-        """写入一条事实；与已有记忆高度相似时合并更新而不是重复添加。"""
+    def _merge_fact(self, content, importance, source="chat"):
+        """只合并完全重复的事实，保留偏好变化和各自的观测时间。"""
         content = str(content or "").strip().replace("\n", " ")[:200]
         if not content:
             return
         now = _now_ts()
         best = None
-        best_score = 0.0
         for entry in self.long_term:
-            score = self._similarity(entry, content)
-            if score > best_score:
-                best, best_score = entry, score
-        threshold = 0.82 if self._embed_ok else 0.58
-        if best is not None and best_score >= threshold:
-            if len(content) > len(best.get("content", "")):
-                best["content"] = content
-                best["embedding"] = None
+            # Similar wording can express opposite preferences. Only exact
+            # duplicates are merged; dated observations retain their origin.
+            if entry.get("content", "").strip() == content:
+                best = entry
+                break
+        if best is not None:
             best["importance"] = max(int(best.get("importance", 3)), int(importance))
             best["updated_at"] = now
             return
         self.long_term.append(
             {
-                "id": f"m{int(now * 1000)}",
+                "id": "m" + uuid.uuid4().hex[:16],
                 "content": content,
                 "importance": max(1, min(5, int(importance))),
                 "created_at": now,
                 "updated_at": now,
                 "hit_count": 0,
                 "embedding": None,
+                "source": source,
             }
         )
 
     def _embed_entries(self, entries):
         """批量补齐长期记忆的向量（只处理缺失项，失败后自动降级为关键词匹配）。"""
-        if not self._embed_ok:
+        if not self._embed_ok or time.monotonic() < self._embedding_retry_at:
             return
         pending = [e for e in entries if not e.get("embedding")]
         for i in range(0, len(pending), EMBED_BATCH_SIZE):
@@ -320,44 +351,96 @@ class PetMemory:
             try:
                 vectors = self._embed.embed([e["content"] for e in batch], timeout=30)
             except Exception:
-                self._embed_ok = False
+                self._embedding_retry_at = time.monotonic() + 60
                 return
             for entry, vector in zip(batch, vectors):
                 if vector:
                     entry["embedding"] = [round(x, 6) for x in vector]
 
-    def _extract(self, chat_client, user_text, reply):
+    def _memory_worker(self):
+        while True:
+            with self._work:
+                self._work.wait_for(lambda: self._closed or self._pending)
+                if self._closed:
+                    return
+                delay = max(0, self._last_extract_ts + MIN_EXTRACT_INTERVAL - _now_ts())
+                if delay:
+                    self._work.wait(timeout=delay)
+                    continue
+                client = self._pending[0][0]
+                batch = []
+                while self._pending and self._pending[0][0] is client and len(batch) < 10:
+                    batch.append(self._pending.popleft())
+                self._last_extract_ts = _now_ts()
+            if not self.enabled:
+                continue
+            transcript = "\n".join(f"使用者：{item[1]}\n你：{item[2]}" for item in batch)
+            try:
+                self._extract(client, transcript, "", source=",".join(sorted({item[3] for item in batch})),
+                              generation=batch[-1][4])
+            except Exception as exc:
+                if self.diagnostics:
+                    self.diagnostics.event("memory.extract_error", error=type(exc).__name__)
+
+    def _extract(self, chat_client, user_text, reply, source="chat", generation=None):
         """用聊天模型从一轮对话里提炼长期记忆；失败时静默跳过。"""
-        now = _now_ts()
-        if now - self._last_extract_ts < MIN_EXTRACT_INTERVAL:
-            return
+        with self._lock:
+            previous_summary = self.summary
+        if generation is None:
+            generation = self._generation
         prompt = (
             "你是记忆提取器。根据下面这轮对话，提取值得长期记住的事实，"
             "比如使用者的姓名、身份、喜好、习惯、重要经历、约定、当前关心的事等。\n"
             f"使用者说：{user_text}\n"
             f"你说：{reply}\n"
-            '只输出 JSON 数组，每项是 {"content": "事实，一句话，用第三人称概括", '
-            '"importance": 1到5的数字}。没有值得记住的内容就输出 []。'
+            f"此前的对话摘要：{previous_summary}\n"
+            '只输出 JSON 对象：{"facts": [{"content": "事实，一句话，用第三人称概括", '
+            '"importance": 1到5的数字}], "summary": "更新后的对话摘要，最多600字"}。'
+            "摘要保留正在讨论的话题、未完成的约定和任务，合并此前摘要与新对话。"
+            "facts 只记使用者明确表达或已经确认的事实，不把你的猜测当成事实。"
+            "偏好变化时保留变化的含义；没有值得记住的事实时 facts 为 []。"
             "不要输出其它任何文字。"
         )
         try:
+            started = time.monotonic()
             raw = chat_client.raw_complete(
-                [{"role": "system", "content": prompt}],
-                max_tokens=400,
-                timeout=25,
-            )
+                [{"role": "system", "content": prompt}], max_tokens=1000, timeout=25)
         except Exception:
             return
-        self._last_extract_ts = now
+        if self.diagnostics:
+            self.diagnostics.event("memory.extracted",
+                                   duration_ms=round((time.monotonic() - started) * 1000))
+        summary = None
+        try:
+            obj = json.loads(str(raw).strip().removeprefix("```json").removesuffix("```").strip())
+            if isinstance(obj, dict):
+                summary = obj.get("summary")
+                raw = json.dumps(obj.get("facts") or [], ensure_ascii=False)
+        except (ValueError, TypeError):
+            pass
         facts = self._parse_facts(raw)
-        if not facts:
-            return
         with self._lock:
+            if generation != self._generation or self._closed or not self.enabled:
+                return
             for content, importance in facts:
-                self._merge_fact(content, importance)
+                self._merge_fact(content, importance, source)
+            if isinstance(summary, str) and summary.strip():
+                self.summary = summary.strip()[:1200]
             self._prune_long()
-            self._embed_entries(self.long_term)
-            self._save_long_term()
+            pending = copy.deepcopy(self.long_term)
+        self._save_long_term()
+        self._save_snapshot(self.summary_path, "summary")
+        self._embed_entries(pending)
+        with self._lock:
+            if generation != self._generation or self._closed or not self.enabled:
+                return
+            vectors = {entry["id"]: entry for entry in pending if entry.get("embedding")}
+            for entry in self.long_term:
+                candidate = vectors.get(entry["id"])
+                if candidate and entry["content"] == candidate["content"]:
+                    entry["embedding"] = candidate["embedding"]
+        self._save_long_term()
+        self._save_snapshot(self.summary_path, "summary")
 
     @staticmethod
     def _parse_facts(raw):
@@ -403,17 +486,21 @@ class PetMemory:
 
     def _scored_memories(self, text):
         """计算每条长期记忆与当前话题的 (相似度, 综合分)；embedding 失败时自动降级关键词。"""
-        use_emb = bool(self.cfg.get("use_embedding", True)) and self._embed_ok
+        with self._lock:
+            entries = copy.deepcopy(self.long_term)
+        use_emb = (bool(self.cfg.get("use_embedding", True)) and self._embed_ok
+                   and time.monotonic() >= self._embedding_retry_at
+                   and all(entry.get("embedding") for entry in entries))
         vector = None
         if use_emb:
             try:
-                (vector,) = self._embed.embed([text], timeout=20)
+                (vector,) = self._embed.embed([text], timeout=2)
             except Exception:
-                self._embed_ok = False
+                self._embedding_retry_at = time.monotonic() + 60
                 use_emb = False
         results = []
-        for entry in self.long_term:
-            if use_emb:
+        for entry in entries:
+            if use_emb and entry.get("embedding"):
                 sim = _cosine(vector, entry.get("embedding") or [])
             else:
                 sim = _jaccard(text, entry.get("content", ""))
@@ -442,11 +529,16 @@ class PetMemory:
         now = _now_ts()
         lines = []
         with self._lock:
+            live = {entry["id"]: entry for entry in self.long_term}
             for entry, _sim, _score in top:
-                entry["hit_count"] = int(entry.get("hit_count", 0)) + 1
-                entry["updated_at"] = now
-                lines.append(f"- {entry.get('content', '')}")
-            self._save_long_term()
+                current = live.get(entry["id"])
+                if current is None:
+                    continue
+                current["hit_count"] = int(current.get("hit_count", 0)) + 1
+                current["last_recalled_at"] = now
+                stamp = datetime.fromtimestamp(entry.get("updated_at", now)).strftime("%Y-%m-%d")
+                lines.append(f"- [{stamp}] {entry.get('content', '')}")
+        self._save_long_term()
         return (
             _time_note()
             + "\n【长期记忆】你记得这些事：\n"
@@ -462,8 +554,14 @@ class PetMemory:
         memory_note 为相关长期记忆提示词（无相关记忆时为 None）。
         history_limit 用于限制短期记忆条数（主动发言/读屏这类轻量场景）。
         """
+        if not self.enabled:
+            return [], None
         history = self.short_term_messages(limit=history_limit)
         memory_note = self.recall(text, top_k=top_k)
+        with self._lock:
+            summary = self.summary
+        if summary:
+            memory_note = (memory_note or _time_note()) + "\n【此前对话摘要】\n" + summary
         if not history and memory_note is None:
             return [], None
         return history, memory_note
@@ -472,8 +570,20 @@ class PetMemory:
 
     def clear(self):
         """清空全部短期与长期记忆（文件同步重置）。"""
-        with self._lock:
-            self.short_term = []
-            self.long_term = []
+        with self._work:
+            with self._lock:
+                self._generation += 1
+                self.short_term = []
+                self.long_term = []
+                self.summary = ""
+            self._pending.clear()
         self._save_short_term()
         self._save_long_term()
+        self._save_snapshot(self.summary_path, "summary")
+
+    def close(self):
+        with self._work:
+            self._closed = True
+            self._pending.clear()
+            self._work.notify_all()
+        self._worker.join(timeout=1)

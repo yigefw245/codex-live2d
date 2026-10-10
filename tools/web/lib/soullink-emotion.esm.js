@@ -2,7 +2,7 @@ var __defProp = Object.defineProperty;
 var __defNormalProp = (obj, key, value) => key in obj ? __defProp(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
 var __publicField = (obj, key, value) => __defNormalProp(obj, typeof key !== "symbol" ? key + "" : key, value);
 
-// node_modules/@soullink-emotion/engine/dist/chunk-WF7NFOHV.js
+// node_modules/.pnpm/@soullink-emotion+engine@0.1.0-beta.1/node_modules/@soullink-emotion/engine/dist/chunk-WF7NFOHV.js
 var actionUnitDefinitions = [
   { key: "au01InnerBrowRaiser", code: "AU01", label: "Inner Brow Raiser", group: "brow", min: 0, max: 1 },
   { key: "au02OuterBrowRaiser", code: "AU02", label: "Outer Brow Raiser", group: "brow", min: 0, max: 1 },
@@ -4203,7 +4203,7 @@ var LipSyncController = class {
   }
   updateProcedural(timeSeconds, options) {
     const syllable = Math.sin(timeSeconds * 18.5) * 0.5 + Math.sin(timeSeconds * 31.2) * 0.25 + 0.5;
-    const mouthOpen = Math.max(0, syllable) * (0.34 + options.intensity * 0.56) * (options.lipGain ?? 1);
+    const mouthOpen = Math.max(0, syllable) * (0.18 + options.intensity * 0.34);
     return {
       mouthOpen,
       headX: Math.sin(timeSeconds * 2.6) * 0.018,
@@ -4230,7 +4230,7 @@ var LipSyncController = class {
     this.previousLevel = level;
     this.previousPeak = peak;
     const intensity = clamp(finiteOr2(options.intensity, 0), 0, 1);
-    const mouthGain = (0.34 + intensity * 0.56) * clamp(options.lipGain ?? 1, 0.25, 3);
+    const mouthGain = 0.18 + intensity * 0.34;
     const accent = clamp(this.accent, 0, 1);
     return {
       mouthOpen: clamp(this.smoothedLevel * mouthGain, 0, 1),
@@ -4925,7 +4925,6 @@ var SoullinkRuntime = class {
     __publicField(this, "bodyMotionGain", 1.25);
     __publicField(this, "idleEnabled", true);
     __publicField(this, "lipSyncEnabled", true);
-    __publicField(this, "lipSyncGain", 1);
     __publicField(this, "voicePlaybackActive", false);
     __publicField(this, "currentPlan", null);
     __publicField(this, "currentProactive", null);
@@ -4961,9 +4960,6 @@ var SoullinkRuntime = class {
   }
   setLipSyncEnabled(enabled) {
     this.lipSyncEnabled = enabled;
-  }
-  setLipSyncGain(gain) {
-    this.lipSyncGain = clamp(gain, 0.25, 3);
   }
   setMotionStyle(options) {
     this.motionStyle = resolveMotionStyle(
@@ -5218,7 +5214,6 @@ var SoullinkRuntime = class {
       enabled: this.lipSyncEnabled,
       speaking: this.voicePlaybackActive,
       intensity: this.currentIntent?.intensity ?? 0,
-      lipGain: this.lipSyncGain,
       deltaSeconds,
       speechAccentGain: this.motionStyle.speechAccentGain,
       ...audioInput
@@ -5431,7 +5426,7 @@ var SoullinkRuntime = class {
   }
 };
 
-// node_modules/@soullink-emotion/runtime-core/dist/index.js
+// node_modules/.pnpm/@soullink-emotion+runtime-c_528dd4fd8b1cd2b88625479e990f26fd/node_modules/@soullink-emotion/runtime-core/dist/index.js
 function nowSeconds() {
   if (typeof performance !== "undefined" && typeof performance.now === "function") {
     return performance.now() / 1e3;
@@ -6068,7 +6063,6 @@ function createSoullinkSession(options) {
     setAutoVoiceEnabled,
     setIdleEnabled: (enabled) => runtime.setIdleEnabled(enabled),
     setLipSyncEnabled: (enabled) => runtime.setLipSyncEnabled(enabled),
-    setLipSyncGain: (gain) => runtime.setLipSyncGain(gain),
     setManualFACS: (facs) => runtime.setManualFACS(facs),
     setManualActionUnits: (actionUnits) => runtime.setManualActionUnits(actionUnits),
     setManualParameters: (parameters) => runtime.setCustomChannels(parameters),
@@ -6169,77 +6163,6 @@ function defaultParameterInfo(id, defaultValue = 0) {
 function clampNumber(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
-function isBrowserAudioAvailable() {
-  return typeof window !== "undefined" && typeof Audio !== "undefined" && typeof URL !== "undefined" && typeof URL.createObjectURL === "function";
-}
-function createBrowserAudioSink() {
-  let currentAudio = null;
-  let ownedUrl = null;
-  let currentSettle = null;
-  function releaseUrl() {
-    if (ownedUrl && typeof URL !== "undefined" && typeof URL.revokeObjectURL === "function") {
-      try {
-        URL.revokeObjectURL(ownedUrl);
-      } catch {
-      }
-    }
-    ownedUrl = null;
-  }
-  function endCurrent() {
-    if (currentAudio) {
-      currentAudio.onended = null;
-      currentAudio.onerror = null;
-      try {
-        currentAudio.pause();
-      } catch {
-      }
-      currentAudio.src = "";
-      currentAudio = null;
-    }
-    releaseUrl();
-    const settle = currentSettle;
-    currentSettle = null;
-    settle?.();
-  }
-  return {
-    async play(src) {
-      if (!isBrowserAudioAvailable()) {
-        return { durationSec: 0, finished: Promise.resolve() };
-      }
-      endCurrent();
-      let url = src.url;
-      if (!url && src.bytes) {
-        url = URL.createObjectURL(new Blob([src.bytes]));
-      }
-      if (!url) {
-        return { durationSec: 0, finished: Promise.resolve() };
-      }
-      if (url.startsWith("blob:")) ownedUrl = url;
-      const audio = new Audio(url);
-      currentAudio = audio;
-      const finished = new Promise((resolve) => {
-        currentSettle = resolve;
-      });
-      const handleEnd = () => {
-        if (currentAudio === audio) endCurrent();
-      };
-      audio.onended = handleEnd;
-      audio.onerror = handleEnd;
-      try {
-        await audio.play();
-      } catch {
-        if (currentAudio === audio) endCurrent();
-        return { durationSec: 0, finished };
-      }
-      const durationSec = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : 0;
-      return { durationSec, finished };
-    },
-    stop() {
-      if (!isBrowserAudioAvailable()) return;
-      endCurrent();
-    }
-  };
-}
 var characterProfile = [
   "\u4F60\u7684\u540D\u5B57\u662F\u300C\u6708\u89C1\u5929\u97F3\u300D\uFF08Tsunami Amane\uFF09\uFF0C\u6BCD\u8BED\u662F\u4E2D\u6587\uFF0C\u662F\u4E00\u540D\u5973\u5927\u5B66\u751F\u3002",
   "\u4F60\u662F\u6B63\u5728\u76F4\u64AD\u7684\u4EBA\u300C\u51CC\u97F3\u300D\u7684 AI \u52A9\u624B\uFF0C\u5F53\u524D\u6B63\u5728\u76F4\u64AD\u4E2D\uFF0C\u8D1F\u8D23\u8BA9\u76F4\u64AD\u95F4\u6C1B\u56F4\u66F4\u70ED\u4E00\u70B9\u3002",
@@ -6250,6 +6173,52 @@ var characterProfile = [
   "\u4E0D\u8981\u9891\u7E41\u7528\u62EC\u53F7\u63CF\u5199\u52A8\u4F5C\uFF0C\u4E0D\u8981\u8BF4\u81EA\u5DF1\u662F\u666E\u901A\u95EE\u7B54 AI\uFF0C\u4E0D\u8981\u8BF4\u6559\uFF0C\u4E0D\u8981\u7A7A\u6CDB\u9E21\u6C64\u3002"
 ].join("\n");
 
+// browser/audio.js
+function createPetAudioSink(onError) {
+  let current = null;
+  function stop2() {
+    if (!current) return;
+    const { audio, url, settle } = current;
+    current = null;
+    audio.onended = null;
+    audio.onerror = null;
+    audio.pause();
+    audio.src = "";
+    if (url) URL.revokeObjectURL(url);
+    settle();
+  }
+  return {
+    stop: stop2,
+    async play(src) {
+      stop2();
+      if (typeof Audio === "undefined") throw new Error("Audio output unavailable");
+      const url = src.url ? null : URL.createObjectURL(new Blob([src.bytes]));
+      const audio = new Audio(src.url || url);
+      let settle;
+      const finished = new Promise((resolve) => {
+        settle = resolve;
+      });
+      const playback = { audio, url, settle };
+      current = playback;
+      audio.onended = () => {
+        if (current === playback) stop2();
+      };
+      audio.onerror = () => {
+        if (current !== playback) return;
+        onError(new Error("Audio playback failed"));
+        stop2();
+      };
+      try {
+        await audio.play();
+      } catch (error) {
+        if (current === playback) stop2();
+        throw error;
+      }
+      return { durationSec: Number.isFinite(audio.duration) ? audio.duration : 0, finished };
+    }
+  };
+}
+
 // browser/bridge.js
 var session = null;
 var modelRef = null;
@@ -6258,6 +6227,7 @@ var started = false;
 var paramsHookAttached = false;
 var headTiltGain = 1;
 var poseKeys = null;
+var voiceError = "";
 function applyParamsHook() {
   const core = modelRef?.internalModel?.coreModel;
   if (!core || typeof core.setParameterValueById !== "function") return;
@@ -6359,7 +6329,9 @@ async function start(config) {
       variantByEmotion: {}
     },
     clock: createRafClock(),
-    audio: createBrowserAudioSink(),
+    audio: createPetAudioSink((error) => {
+      voiceError = error.message;
+    }),
     tts: {
       async synthesize(text, ctx) {
         const response = await fetch(config.ttsUrl, {
@@ -6392,6 +6364,9 @@ async function start(config) {
     },
     motionStyle: style,
     onSnapshot(snapshot) {
+      if (snapshot?.voiceStatus === "error") {
+        voiceError = snapshot.apiError || "Speech synthesis failed";
+      }
       if (snapshot?.runtime) applyNativeAnimation(snapshot.runtime);
     }
   });
@@ -6400,7 +6375,7 @@ async function start(config) {
   session.setBodyMotionGain(
     Math.min(4, Math.max(0, Number(config.bodyMotionGain) || 2.8))
   );
-  if (typeof config.lipSyncGain === "number") {
+  if (typeof config.lipSyncGain === "number" && typeof session.setLipSyncGain === "function") {
     session.setLipSyncGain(config.lipSyncGain);
   }
   session.start();
@@ -6423,16 +6398,19 @@ function react(intent) {
   if (!session || !intent) return;
   session.triggerIntent(intent);
 }
-function speak(payload) {
-  if (!session || !payload || !payload.text) return Promise.resolve();
-  return session.speak({
+async function speak(payload) {
+  if (!session || !payload || !payload.text) throw new Error("Speech service is not ready");
+  const speakingSession = session;
+  voiceError = "";
+  await speakingSession.speak({
     text: payload.text,
     emotion: payload.emotion,
     vad: payload.vad,
     intent: payload.intent || null,
-    planSpeakingMotion: false
-  }).catch(() => {
+    planSpeakingMotion: false,
+    force: true
   });
+  if (session === speakingSession && voiceError) throw new Error(voiceError);
 }
 function stopVoice() {
   session?.stopVoice();

@@ -74,6 +74,7 @@ html, body {
 }
 #chat-input {
   flex: 1;
+  min-width: 0;
   border-radius: 10px;
   border: 1px solid #3a5a78;
   background: rgba(255, 255, 255, 0.09);
@@ -89,6 +90,7 @@ html, body {
   background: rgba(255, 255, 255, 0.09);
   color: #fff;
   width: 38px;
+  flex-shrink: 0;
   font-size: 17px;
   cursor: pointer;
   transition: background 0.2s, box-shadow 0.2s;
@@ -101,6 +103,10 @@ html, body {
   border-color: #e74c3c;
   box-shadow: 0 0 12px rgba(231, 76, 60, 0.7);
 }
+#chat-mic.busy {
+  opacity: 0.6;
+  cursor: wait;
+}
 #chat-send {
   border-radius: 10px;
   border: none;
@@ -109,6 +115,19 @@ html, body {
   padding: 0 14px;
   font-size: 14px;
   cursor: pointer;
+}
+#chat-stop {
+  width: 32px;
+  flex-shrink: 0;
+  border: 1px solid #666;
+  border-radius: 6px;
+  background: transparent;
+  color: #eee;
+  cursor: pointer;
+}
+#chat-stop:disabled {
+  opacity: 0.35;
+  cursor: default;
 }
 /* 横向裁切后窗口变窄时，自动适配聊天框布局 */
 @media (max-width: 280px) {
@@ -125,7 +144,7 @@ html, body {
   }
 }
 @media (max-width: 210px) {
-  #chat-mic {
+  #chat-mic.show {
     display: none;
   }
   #chat-send {
@@ -143,6 +162,7 @@ html, body {
     <button id="chat-back" title="返回 Codex 模式">←</button>
     <input id="chat-input" type="text" placeholder="和 yumi 说点什么…" autocomplete="off" />
     <button id="chat-mic" title="语音输入">🎤</button>
+    <button id="chat-stop" title="停止回复和朗读" aria-label="停止回复和朗读" disabled>&#9632;</button>
     <button id="chat-send">发送</button>
   </div>
 </div>

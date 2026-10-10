@@ -14,10 +14,11 @@ import time
 import urllib.parse
 import urllib.request
 import zipfile
+from concurrent.futures import CancelledError, TimeoutError as FutureTimeoutError
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 from PySide6.QtCore import QBuffer, QIODevice, QObject, QTimer, QUrl, Qt, Signal, Slot
-from PySide6.QtGui import QAction, QColor, QCursor, QGuiApplication
+from PySide6.QtGui import QAction, QColor, QCursor, QDesktopServices, QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -48,7 +49,9 @@ from PySide6.QtWebEngineWidgets import QWebEngineView
 import codex_monitor
 import numen_bridge
 import pet_memory
+import pet_runtime
 import soullink_runner
+import sts2_bridge
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ERROR_LOG = os.path.join(BASE_DIR, "pet_error.log")
@@ -550,7 +553,7 @@ SOULLINK_DEFAULTS = {
     "tts": {
         "base_url": "https://dashscope.aliyuncs.com/api/v1",
         "api_key": "",
-        "model": "qwen-tts",
+        "model": "qwen3-tts-flash",
         "voice": "Cherry",
         "language_type": "Chinese",
     },
@@ -583,6 +586,7 @@ VOICE_INPUT_DEFAULTS = {
     "model": "small",
     "language": "zh",
     "hf_endpoint": "",
+    "input_device_index": None,
     "hotkey_enabled": True,
     "hotkey_key": "F8",
     "hotkey_modifiers": "",
@@ -608,7 +612,7 @@ VOICE_CHAT_DEFAULTS = {
     "tts": {
         "base_url": "https://dashscope.aliyuncs.com/api/v1",
         "api_key": "",
-        "model": "qwen-tts",
+        "model": "qwen3-tts-flash",
         "voice": "Cherry",
         "language_type": "Chinese",
     },
@@ -1011,6 +1015,30 @@ def save_minecraft_config(cfg):
         json.dump(root, f, ensure_ascii=False, indent=2)
 
 
+def load_sts2_config():
+    try:
+        with open(os.path.join(BASE_DIR, "config.json"), encoding="utf-8") as stream:
+            saved = json.load(stream).get("slay_the_spire_2")
+    except (OSError, ValueError, AttributeError):
+        saved = None
+    return sts2_bridge.normalize_config(saved)
+
+
+def save_sts2_config(cfg):
+    path = os.path.join(BASE_DIR, "config.json")
+    try:
+        with open(path, encoding="utf-8") as stream:
+            root = json.load(stream)
+    except FileNotFoundError:
+        root = {}
+    if not isinstance(root, dict):
+        raise ValueError("配置文件格式不正确，未覆盖原文件")
+    root["slay_the_spire_2"] = sts2_bridge.normalize_config(cfg)
+    with open(path + ".tmp", "w", encoding="utf-8") as stream:
+        json.dump(root, stream, ensure_ascii=False, indent=2)
+    os.replace(path + ".tmp", path)
+
+
 def load_voice_input_config():
     """读取语音输入配置：开关 + 本地识别模型（RealtimeSTT / faster-whisper）。"""
     cfg = dict(VOICE_INPUT_DEFAULTS)
@@ -1021,6 +1049,9 @@ def load_voice_input_config():
             cfg["enabled"] = saved["enabled"]
         if isinstance(saved.get("hotkey_enabled"), bool):
             cfg["hotkey_enabled"] = saved["hotkey_enabled"]
+        device_index = saved.get("input_device_index")
+        if type(device_index) is int and device_index >= 0:
+            cfg["input_device_index"] = device_index
         for key in ("model", "language", "hf_endpoint", "hotkey_key", "hotkey_modifiers"):
             if isinstance(saved.get(key), str) and saved[key].strip():
                 cfg[key] = saved[key].strip()
@@ -1294,29 +1325,30 @@ class ChatClient:
         self.key = str(cfg.get("api_key", ""))
         self.model = str(cfg.get("model", CHAT_DEFAULTS["model"]))
         self.persona = str(cfg.get("persona", CHAT_DEFAULTS["persona"]))
+        self.context_budget = max(1000, int(cfg.get("context_budget", 6000)))
+        self.reply_tokens = max(100, int(cfg.get("max_reply_tokens", 512)))
 
     def ready(self):
         return bool(self.key and self.base)
 
     def chat(self, history, text, memory_note=None, timeout=60):
-        messages = [{"role": "system", "content": self.persona}]
-        if memory_note:
-            messages.append({"role": "system", "content": memory_note})
-        messages.extend(history[-20:])
-        messages.append({"role": "user", "content": text})
-        return self.raw_complete(messages, max_tokens=300, timeout=timeout)
+        messages = pet_runtime.dialogue_messages(
+            self.persona, history, text, memory_note, self.context_budget)
+        return self.raw_complete(messages, max_tokens=self.reply_tokens, timeout=timeout)
 
     def chat_stream(self, history, text, memory_note=None, on_chunk=None, timeout=120):
+        return pet_runtime.cancellable_io(lambda: self._chat_stream_request(
+            history, text, memory_note, on_chunk, timeout))
+
+    def _chat_stream_request(self, history, text, memory_note=None, on_chunk=None, timeout=120):
         """流式聊天（SSE）：逐字回调 on_chunk，返回完整回复。"""
-        messages = [{"role": "system", "content": self.persona}]
-        if memory_note:
-            messages.append({"role": "system", "content": memory_note})
-        messages.extend(history[-20:])
-        messages.append({"role": "user", "content": text})
+        pet_runtime.checkpoint()
+        messages = pet_runtime.dialogue_messages(
+            self.persona, history, text, memory_note, self.context_budget)
         body = {
             "model": self.model,
             "messages": messages,
-            "max_tokens": 300,
+            "max_tokens": self.reply_tokens,
             "stream": True,
         }
         request = urllib.request.Request(
@@ -1330,6 +1362,7 @@ class ChatClient:
         full = []
         with urllib.request.urlopen(request, timeout=timeout) as response:
             for raw in response:
+                pet_runtime.checkpoint()
                 line = raw.decode("utf-8", errors="replace").strip()
                 if not line.startswith("data:"):
                     continue
@@ -1349,12 +1382,20 @@ class ChatClient:
                     if on_chunk:
                         try:
                             on_chunk(delta)
+                        except pet_runtime.TurnCancelled:
+                            raise
                         except Exception:
                             pass
+        pet_runtime.checkpoint()
         return "".join(full)
 
     def raw_complete(self, messages, max_tokens=300, timeout=60):
+        return pet_runtime.cancellable_io(
+            lambda: self._raw_complete_request(messages, max_tokens, timeout))
+
+    def _raw_complete_request(self, messages, max_tokens=300, timeout=60):
         """直接发送一组消息并返回模型文本（记忆提炼等内部调用使用）。"""
+        pet_runtime.checkpoint()
         body = {
             "model": self.model,
             "messages": messages,
@@ -1370,6 +1411,7 @@ class ChatClient:
         )
         with urllib.request.urlopen(request, timeout=timeout) as response:
             data = json.loads(response.read().decode("utf-8"))
+        pet_runtime.checkpoint()
         return str(data["choices"][0]["message"]["content"]).strip()
 
     def complete(self, messages, tools=None, timeout=120, max_tokens=1024):
@@ -1415,6 +1457,11 @@ class VisionClient:
         return bool(self.key and self.base and self.model)
 
     def describe(self, image_b64, mime="image/jpeg", timeout=90):
+        return pet_runtime.cancellable_io(
+            lambda: self._describe_request(image_b64, mime, timeout))
+
+    def _describe_request(self, image_b64, mime="image/jpeg", timeout=90):
+        pet_runtime.checkpoint()
         body = {
             "model": self.model,
             "messages": [
@@ -1443,6 +1490,7 @@ class VisionClient:
         )
         with urllib.request.urlopen(request, timeout=timeout) as response:
             data = json.loads(response.read().decode("utf-8"))
+        pet_runtime.checkpoint()
         return str(data["choices"][0]["message"]["content"]).strip()
 
 
@@ -1455,7 +1503,7 @@ class TtsClient:
             cfg.get("base_url") or VOICE_CHAT_DEFAULTS["tts"]["base_url"]
         ).rstrip("/")
         self.key = str(cfg.get("api_key") or "")
-        self.model = str(cfg.get("model") or "qwen-tts")
+        self.model = str(cfg.get("model") or VOICE_CHAT_DEFAULTS["tts"]["model"])
         self.voice = str(cfg.get("voice") or "Cherry")
         self.language_type = str(cfg.get("language_type") or "Chinese")
 
@@ -1501,6 +1549,7 @@ class LocalVoiceRecognizer:
         self.model = str(cfg.get("model") or VOICE_INPUT_DEFAULTS["model"])
         self.language = str(cfg.get("language") or VOICE_INPUT_DEFAULTS["language"])
         self.hf_endpoint = str(cfg.get("hf_endpoint") or "").strip()
+        self.input_device_index = cfg.get("input_device_index")
         self.silence_duration = 0.8
         self._recorder = None
         self._ready = False
@@ -1688,6 +1737,9 @@ class LocalVoiceRecognizer:
             ensure_sentence_starting_uppercase=False,
             ensure_sentence_ends_with_period=False,
             use_microphone=True,
+            input_device_index=self.input_device_index,
+            min_length_of_recording=0,
+            min_gap_between_recordings=0,
             post_speech_silence_duration=max(
                 0.3, float(self.silence_duration)
             ),
@@ -1738,8 +1790,15 @@ class LocalVoiceRecognizer:
                 return ""
             self._recording = False
         try:
+            self._error = ""
             recorder.stop()
-            return str(recorder.text() or "").strip()
+            # text() would arm a new VAD recording if an empty recording was
+            # stopped. Consume this recording first, then transcribe only it.
+            recorder.wait_audio()
+            if recorder.audio.size == 0:
+                self._error = "没有录到声音，请检查麦克风是否静音后重试"
+                return ""
+            return str(recorder.transcribe() or "").strip()
         except Exception as exc:
             self._error = f"语音识别失败：{exc}"
             return ""
@@ -1751,7 +1810,12 @@ class LocalVoiceRecognizer:
             self._recording = False
         if recorder is not None:
             try:
-                recorder.abort()
+                # RealtimeSTT.abort() waits for text() to acknowledge it; manual
+                # recordings have no text() waiter and would block forever.
+                if recorder.is_recording:
+                    recorder.stop()
+                    recorder.wait_audio()
+                recorder.set_microphone(False)
             except Exception:
                 pass
 
@@ -1902,6 +1966,17 @@ class ChatSettingsDialog(QDialog):
         form.addRow("API Key", self.api_key_edit)
         form.addRow("模型", self.model_edit)
         form.addRow("人物设定", self.persona_edit)
+        self.context_spin = QSpinBox()
+        self.context_spin.setRange(1000, 128000)
+        self.context_spin.setSingleStep(1000)
+        self.context_spin.setValue(int(cfg.get("context_budget", 6000)))
+        self.context_spin.setSuffix(" tokens")
+        self.reply_spin = QSpinBox()
+        self.reply_spin.setRange(100, 4096)
+        self.reply_spin.setValue(int(cfg.get("max_reply_tokens", 512)))
+        self.reply_spin.setSuffix(" tokens")
+        form.addRow("对话上下文预算", self.context_spin)
+        form.addRow("回复长度上限", self.reply_spin)
         layout.addLayout(form)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -1915,6 +1990,8 @@ class ChatSettingsDialog(QDialog):
             "api_key": self.api_key_edit.text().strip(),
             "model": self.model_edit.text().strip(),
             "persona": self.persona_edit.toPlainText().strip(),
+            "context_budget": self.context_spin.value(),
+            "max_reply_tokens": self.reply_spin.value(),
         }
 
 
@@ -2421,6 +2498,50 @@ class MinecraftSettingsDialog(QDialog):
         }
 
 
+class Sts2SettingsDialog(QDialog):
+    def __init__(self, cfg, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("杀戮尖塔2 设置（STS2MCP）")
+        self.setMinimumWidth(440)
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.port = QSpinBox()
+        self.port.setRange(1, 65535)
+        self.port.setValue(cfg['port'])
+        self.goal = QPlainTextEdit(cfg['goal'])
+        self.goal.setFixedHeight(84)
+        self.interval = QSpinBox()
+        self.interval.setRange(1, 60)
+        self.interval.setValue(cfg['interval_seconds'])
+        self.interval.setSuffix(" 秒")
+        self.steps = QSpinBox()
+        self.steps.setRange(1, 1000)
+        self.steps.setValue(cfg['max_steps'])
+        self.steps.setSuffix(" 次")
+        self.timeout = QSpinBox()
+        self.timeout.setRange(5, 180)
+        self.timeout.setValue(cfg['decision_timeout_seconds'])
+        self.timeout.setSuffix(" 秒")
+        self.narration = QCheckBox("每回合说一句")
+        self.narration.setChecked(cfg['narration'])
+        form.addRow("本机端口", self.port)
+        form.addRow("玩法目标", self.goal)
+        form.addRow("行动间隔", self.interval)
+        form.addRow("每段操作上限", self.steps)
+        form.addRow("决策超时", self.timeout)
+        form.addRow("", self.narration)
+        layout.addLayout(form)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def values(self):
+        return dict(port=self.port.value(), goal=self.goal.toPlainText(),
+                    interval_seconds=self.interval.value(), max_steps=self.steps.value(),
+                    decision_timeout_seconds=self.timeout.value(), narration=self.narration.isChecked())
+
+
 class VoiceInputSettingsDialog(QDialog):
     """语音输入设置：本地识别模型（RealtimeSTT / faster-whisper）。"""
 
@@ -2462,6 +2583,33 @@ class VoiceInputSettingsDialog(QDialog):
 
         form.addRow("识别模型", self.model_combo)
         form.addRow("识别语言", self.language_combo)
+        self.microphone_combo = QComboBox()
+        self.microphone_combo.addItem("系统默认麦克风", None)
+        audio_interface = None
+        try:
+            import pyaudio
+
+            audio_interface = pyaudio.PyAudio()
+            for index in range(audio_interface.get_device_count()):
+                device = audio_interface.get_device_info_by_index(index)
+                if device.get("maxInputChannels", 0) <= 0:
+                    continue
+                host = audio_interface.get_host_api_info_by_index(device["hostApi"])
+                self.microphone_combo.addItem(
+                    f"{device['name']} ({host['name']})", index
+                )
+        except Exception:
+            pass
+        finally:
+            if audio_interface is not None:
+                audio_interface.terminate()
+        device_index = cfg.get("input_device_index")
+        idx = self.microphone_combo.findData(device_index)
+        if idx < 0 and device_index is not None:
+            self.microphone_combo.addItem(f"麦克风 #{device_index}", device_index)
+            idx = self.microphone_combo.count() - 1
+        self.microphone_combo.setCurrentIndex(max(0, idx))
+        form.addRow("麦克风", self.microphone_combo)
         self.endpoint_edit = QLineEdit(str(cfg.get("hf_endpoint", "")).strip())
         self.endpoint_edit.setPlaceholderText("例如 https://hf-mirror.com（默认留空）")
         form.addRow("模型下载镜像", self.endpoint_edit)
@@ -2535,6 +2683,7 @@ class VoiceInputSettingsDialog(QDialog):
             "model": str(self.model_combo.currentData() or "small"),
             "language": str(self.language_combo.currentData() or ""),
             "hf_endpoint": self.endpoint_edit.text().strip(),
+            "input_device_index": self.microphone_combo.currentData(),
             "hotkey_enabled": self.hotkey_check.isChecked(),
             "hotkey_key": str(self.hotkey_combo.currentData() or "F8"),
             "hotkey_modifiers": str(self.hotkey_mods_combo.currentData() or ""),
@@ -2687,16 +2836,24 @@ class PetBridge(QObject):
         """Soullink 朗读结束回调（语音对话期间用于恢复麦克风）。"""
         self.window._on_tts_played()
 
+    @Slot(int, str)
+    def tts_result(self, generation, error):
+        self.window._on_tts_result(generation, error)
+
     @Slot()
     def voice_toggle(self):
         self.window.toggle_voice_recording()
+
+    @Slot()
+    def stop_reply(self):
+        self.window.interrupt_dialogue()
 
 
 class PetWindow(QWidget):
     chat_reply = Signal(str)
     chat_reply_quiet = Signal(str)
     soullink_event = Signal(str)
-    soullink_speech = Signal(str)
+    soullink_speech = Signal(str, int)
     soullink_react = Signal(str)
     soullink_js = Signal(str)
     soullink_status = Signal(str)
@@ -2706,9 +2863,16 @@ class PetWindow(QWidget):
     voice_send = Signal(str)
     voice_ptt_down = Signal()
     voice_ptt_up = Signal()
-    voice_play = Signal(str)
+    voice_play = Signal(str, int)
+    playback_stop = Signal()
+    dialogue_state = Signal(bool)
     voice_shot_requested = Signal()
     mc_status = Signal(str)
+    sts2_finished = Signal(object, int)
+    sts2_status = Signal(str)
+    sts2_ui_command = Signal(str)
+    sts2_text_requested = Signal(str, object)
+    dialogue_interrupt_requested = Signal()
 
     def __init__(self):
         super().__init__()
@@ -2739,8 +2903,16 @@ class PetWindow(QWidget):
         self.base_bh = float(BASE_H)
         chat_cfg = load_chat_config()
         self.chat_client = ChatClient(chat_cfg)
+        self.diagnostics = pet_runtime.Diagnostics(os.path.join(BASE_DIR, "pet_runtime.log"))
+        self._speech_generation = 0
+        self.playback_stop.connect(self._stop_playback)
+        self.dialogue_interrupt_requested.connect(self.interrupt_dialogue)
+        self.dialogue_state.connect(self._update_dialogue_busy)
+        self.dialogue = pet_runtime.DialogueRuntime(
+            self.diagnostics, on_interrupt=self._request_stop_playback,
+            on_state=self.dialogue_state.emit)
         self.memory_cfg = load_memory_config()
-        self.memory = pet_memory.PetMemory(self.memory_cfg, BASE_DIR)
+        self.memory = pet_memory.PetMemory(self.memory_cfg, BASE_DIR, self.diagnostics)
         self.chat_mode = False
         self.chat_reply.connect(self._show_chat_reply)
         self.chat_reply_quiet.connect(self._show_chat_reply_quiet)
@@ -2835,6 +3007,20 @@ class PetWindow(QWidget):
         self.mc_last_user_msg = None
         if self.mc_cfg.get("enabled"):
             QTimer.singleShot(0, lambda: self.set_mc_enabled(True))
+        self.sts2_cfg = load_sts2_config()
+        self.sts2_timer = QTimer(self)
+        self.sts2_timer.timeout.connect(self._sts2_step)
+        self.sts2_busy = False
+        self.sts2_stop = threading.Event()
+        self.sts2_stop.set()
+        self.sts2_token = 0
+        self.sts2_steps = 0
+        self.sts2_last_state = "尚未连接"
+        self.sts2_brain = None
+        self.sts2_finished.connect(self._sts2_on_finished)
+        self.sts2_status.connect(self._notify)
+        self.sts2_ui_command.connect(self._handle_sts2_command)
+        self.sts2_text_requested.connect(self._show_sts2_text)
         if self.voice_chat_cfg.get("enabled"):
             QTimer.singleShot(
                 0, lambda: self.set_voice_chat_enabled(True)
@@ -2895,6 +3081,7 @@ class PetWindow(QWidget):
         app = QApplication.instance()
         if app is not None:
             app.aboutToQuit.connect(self.save_position)
+            app.aboutToQuit.connect(self._shutdown_services)
 
         self.refresh_status()
         self.show()
@@ -2996,6 +3183,7 @@ class PetWindow(QWidget):
             f"{float(self.settings.get('crop_side', 0.0))})"
         )
         self._push_soullink_config()
+        self._update_dialogue_busy()
 
     def set_state(self, name):
         self.state = name
@@ -3253,9 +3441,16 @@ class PetWindow(QWidget):
         t = str(text or "")
         return any(keyword in t for keyword in SCREEN_LOOK_KEYWORDS)
 
-    def handle_chat(self, text):
+    def handle_chat(self, text, turn_id=None):
         text = " ".join(str(text).split())
         if not text:
+            return
+        if self._handle_sts2_command(text):
+            return
+        if text in ("停一下", "打住", "停止朗读", "先别说了", "别说了"):
+            self.interrupt_dialogue()
+            if self.mc_cfg.get("enabled") and text == "停一下":
+                self.mc_stop_now()
             return
         if not self.chat_client or not self.chat_client.ready():
             self._run_js(
@@ -3285,11 +3480,10 @@ class PetWindow(QWidget):
                 shot = self._capture_screen_base64()
             except Exception:
                 shot = None
-        threading.Thread(
-            target=self._chat_worker,
-            args=(text, shot[0] if shot else None, shot[1] if shot else None),
-            daemon=True,
-        ).start()
+        self.dialogue.submit(
+            "chat", lambda: self._chat_worker(
+                text, shot[0] if shot else None, shot[1] if shot else None),
+            turn_id=turn_id)
 
     def _chat_worker(self, text, image_b64=None, mime=None):
         success = False
@@ -3297,14 +3491,17 @@ class PetWindow(QWidget):
         try:
             if image_b64:
                 try:
-                    screen_desc = self.vision_client.describe(
-                        image_b64, mime or "image/jpeg"
-                    )
+                    with pet_runtime.stage("vision"):
+                        screen_desc = self.vision_client.describe(
+                            image_b64, mime or "image/jpeg")
+                except pet_runtime.TurnCancelled:
+                    raise
                 except Exception:
                     screen_desc = None
             try:
                 # 短期记忆为主，长期记忆按相关度补充；都没有则按人设回答
-                history, memory_note = self.memory.dialogue_context(text)
+                with pet_runtime.stage("memory.recall"):
+                    history, memory_note = self.memory.dialogue_context(text)
             except Exception:
                 history, memory_note = [], None
             user_content = text
@@ -3315,6 +3512,7 @@ class PetWindow(QWidget):
                     "请参考屏幕内容自然回答我的问题，不要提及“看了屏幕”或识图。）"
                 )
             mc_note = self._mc_context_note()
+            mc_note = "\n".join(note for note in (mc_note, self._sts2_context_note()) if note)
             if mc_note:
                 user_content = f"{user_content}\n（背景信息：{mc_note}）"
             # 流式生成 + 逐句朗读（出字就开始 TTS）
@@ -3322,8 +3520,19 @@ class PetWindow(QWidget):
                 history, user_content, memory_note, text
             )
             success = True
+        except pet_runtime.TurnCancelled:
+            raise
         except Exception as exc:
             reply = f"（连接失败：{exc}）"
+        pet_runtime.checkpoint()
+        # Persist this turn before playback completes so the next request can
+        # immediately see it. Extraction runs on the memory worker.
+        if success:
+            if screen_desc:
+                self.memory.record_line("user", f"（屏幕观察：{screen_desc}）", source="screen")
+            with pet_runtime.stage("memory.record"):
+                self.memory.record_turn(text, reply, source="chat", extract=True,
+                                        chat_client=self.chat_client)
         # 先展示回复
         soullink_handled = False
         if self._soullink_usable() and success and not self._is_error_reply(reply):
@@ -3331,6 +3540,7 @@ class PetWindow(QWidget):
                 intent = self.soullink_runner.classify(text)
             except Exception:
                 intent = None
+            pet_runtime.checkpoint()
             if intent:
                 # 朗读已由流式逐句完成，这里只做情绪反应
                 self.soullink_react.emit(
@@ -3345,28 +3555,7 @@ class PetWindow(QWidget):
                 soullink_handled = True
         if not soullink_handled:
             self.chat_reply.emit(reply)
-        # 等独立 TTS 队列播完；再落盘记忆（提炼放最后不阻塞展示）
-        try:
-            self._tts_queue.join()
-        except Exception:
-            pass
-        try:
-            if success:
-                if screen_desc:
-                    self.memory.record_line(
-                        "user",
-                        f"（我看到的屏幕内容：{screen_desc}）",
-                        source="screen",
-                    )
-                self.memory.record_turn(
-                    text,
-                    reply,
-                    source="chat",
-                    extract=True,
-                    chat_client=self.chat_client,
-                )
-        except Exception:
-            pass
+        self._wait_for_speech(speech_sent if success else False)
 
     def _show_chat_reply(self, reply):
         emotion = classify_emotion(reply)
@@ -3426,7 +3615,8 @@ class PetWindow(QWidget):
             return
         self.memory_cfg = dialog.values()
         save_memory_config(self.memory_cfg)
-        self.memory = pet_memory.PetMemory(self.memory_cfg, BASE_DIR)
+        self.memory.close()
+        self.memory = pet_memory.PetMemory(self.memory_cfg, BASE_DIR, self.diagnostics)
         self._notify("记忆设置已保存")
 
     def view_memory(self):
@@ -3437,6 +3627,9 @@ class PetWindow(QWidget):
                  f"{self.memory_cfg.get('short_term_max_hours', 24)} 小时内）"]
         source_label = {
             "chat": "",
+            "voice": "（语音）",
+            "sts2": "（尖塔）",
+            "interrupted": "（被打断）",
             "proactive": "（主动）",
             "screen": "（读屏）",
         }
@@ -3451,6 +3644,9 @@ class PetWindow(QWidget):
             label = "你" if speaker == "user" else "yumi"
             tag = source_label.get(item.get("source"), "")
             lines.append(f"{stamp} {label}{tag}：{item.get('content', '')}")
+        lines.append("")
+        lines.append("【对话摘要】")
+        lines.append(self.memory.summary or "（暂无）")
         lines.append("")
         lines.append(f"【长期记忆】（共 {len(long_entries)} 条）")
         for entry in sorted(
@@ -3531,6 +3727,11 @@ class PetWindow(QWidget):
         # 不再受聊天模式限制：聊天框开着也照常主动发言
         if self.proactive_busy or self.screen_read_busy:
             return
+        if (self.dialogue.busy or self.voice_recording or self.voice_busy
+                or self.voice_chat_active or self.mc_busy
+                or self.sts2_timer.isActive() or self.sts2_busy
+                or time.monotonic() - self.dialogue.last_user_at < 90):
+            return
         now = time.monotonic()
         elapsed = now - self.last_proactive_ts
         interval = max(1, int(self.proactive_cfg.get("interval_minutes", 15))) * 60
@@ -3547,7 +3748,8 @@ class PetWindow(QWidget):
             return
         self.last_proactive_ts = now
         self.proactive_busy = True
-        threading.Thread(target=self._proactive_worker, daemon=True).start()
+        future = self.dialogue.submit("proactive", self._proactive_worker, priority=20)
+        future.add_done_callback(lambda _: setattr(self, "proactive_busy", False))
 
     def _proactive_worker(self):
         try:
@@ -3558,7 +3760,11 @@ class PetWindow(QWidget):
                     "请以你的人物设定，主动说一句简短自然的话（一两句话），"
                     "可以是关心、碎碎念、自言自语或分享此刻的心情。"
                     "不要使用 Markdown，不要提及你是 AI 或模型，不要加引号。"
+                    "如果现在没有值得说的话，或只是重复最近说过的内容，只输出 [SILENT]。"
                 )
+                events = self.dialogue.recent_events()
+                if events:
+                    prompt += "\n近期已发生的事件：\n" + events
                 try:
                     # 短期记忆为主，长期记忆按相关度补充；都没有则按人设回答
                     history, memory_note = self.memory.dialogue_context(
@@ -3571,6 +3777,9 @@ class PetWindow(QWidget):
                     prompt,
                     memory_note=memory_note,
                 )
+                pet_runtime.checkpoint()
+                if reply.strip() == "[SILENT]":
+                    return
                 try:
                     self.memory.record_line(
                         "assistant", reply, source="proactive"
@@ -3579,17 +3788,24 @@ class PetWindow(QWidget):
                     pass
             if not reply:
                 reply = random.choice(PROACTIVE_FALLBACK_LINES)
+        except pet_runtime.TurnCancelled:
+            raise
         except Exception:
             reply = random.choice(PROACTIVE_FALLBACK_LINES)
         finally:
             self.proactive_busy = False
+        pet_runtime.checkpoint()
         self._emit_speech(reply)
 
-    def _emit_speech(self, reply):
+    def _emit_speech(self, reply, text_delivery=None, require_audio=False):
         """主动发言出口：TTS 朗读时不出气泡、不读括号；仅文本模式时显示气泡。"""
         reply = str(reply or "").strip()
         if not reply:
             return
+        deliver_text = text_delivery or self.chat_reply.emit
+        pet_runtime.checkpoint()
+        generation = self._speech_generation
+        self.voice_tts_done.clear()
         tts_ok = bool(
             self.voice_chat_cfg.get("tts_enabled")
             and self._tts_client.ready()
@@ -3599,30 +3815,47 @@ class PetWindow(QWidget):
                 intent = self.soullink_runner.classify(reply)
             except Exception:
                 intent = None
-            if intent:
-                # Soullink 朗读：不出气泡，括号内容不读
-                self.soullink_event.emit(
-                    json.dumps(
-                        {
-                            "reply": reply,
-                            "speak_text": self._tts_text(reply),
-                            "intent": intent,
-                            "no_bubble": True,
-                        },
-                        ensure_ascii=False,
-                    )
+            pet_runtime.checkpoint()
+            # Emotion classification is optional; it must not gate speech.
+            self.soullink_event.emit(
+                json.dumps(
+                    {
+                        "reply": reply,
+                        "speak_text": self._tts_text(reply),
+                        "intent": intent,
+                        "no_bubble": True,
+                        "generation": generation,
+                    },
+                    ensure_ascii=False,
                 )
+            )
+            try:
+                self._wait_for_speech(True)
                 return
+            except pet_runtime.TurnCancelled:
+                raise
+            except Exception as exc:
+                pet_runtime.mark('tts.soullink_failed', error=type(exc).__name__)
+                pet_runtime.checkpoint()
+                if generation != self._speech_generation:
+                    raise pet_runtime.TurnCancelled()
+                if not tts_ok and require_audio:
+                    raise sts2_bridge.Sts2Error('这一步的旁白没能播出来，我先暂停一下。') from exc
         if tts_ok:
             # 独立 TTS 朗读：不出气泡，括号内容不读
             try:
-                self._speak_voice(self._tts_text(reply))
-            except Exception:
+                self._speak_voice(self._tts_text(reply), generation)
+            except pet_runtime.TurnCancelled:
+                raise
+            except Exception as exc:
+                pet_runtime.mark('tts.standalone_failed', error=type(exc).__name__)
+                if require_audio:
+                    raise sts2_bridge.Sts2Error('这一步的旁白没能播出来，我先暂停一下。') from exc
                 # 朗读失败退回文本模式
-                self.chat_reply.emit(reply)
+                deliver_text(reply)
             return
         # 纯文本模式：显示气泡（保留原文）
-        self.chat_reply.emit(reply)
+        deliver_text(reply)
 
     # ---------- 语音输入 ----------
 
@@ -3690,6 +3923,7 @@ class PetWindow(QWidget):
         self.voice_recognizer.set_progress_callback(
             lambda text: self.voice_status.emit(text)
         )
+        self._run_js("window.setVoiceBusy(false, '点击开始或结束录音')")
         if self.voice_cfg.get("enabled") and self.voice_cfg.get(
             "hotkey_enabled"
         ):
@@ -3711,44 +3945,61 @@ class PetWindow(QWidget):
         if self.voice_recording:
             self._voice_stop_and_send()
             return
+        if self.dialogue.busy:
+            self.interrupt_dialogue()
         self._voice_start()
 
     def _voice_start(self):
         if self.voice_busy or self.voice_recording:
             return
         self.voice_pending_abort = False
+        self._voice_trace_id = f"asr-{time.monotonic_ns()}"
+        diagnostics = getattr(self, "diagnostics", None)
+        started = time.monotonic()
+        if diagnostics:
+            diagnostics.event("asr.initialize.start", self._voice_trace_id)
+        token = self.voice_token
+        recognizer = self.voice_recognizer
 
         def _begin():
-            token = self.voice_token
-            if self.voice_recognizer.needs_model():
-                self.voice_status.emit(
-                    "正在下载语音识别模型（首次需要，可能几分钟）…"
-                )
-            if not self.voice_recognizer.start():
-                self.voice_busy = False
-                if token == self.voice_token:
+            try:
+                if recognizer.needs_model():
                     self.voice_status.emit(
-                        self.voice_recognizer.error() or "语音识别启动失败"
+                        "正在下载语音识别模型（首次需要，可能几分钟）…"
                     )
-                return
-            if token != self.voice_token:
-                self.voice_busy = False
-                return
-            if self.voice_pending_abort:
-                # 按键已松开（或录音被取消），不进入录音状态
-                self.voice_pending_abort = False
-                self.voice_busy = False
-                self.voice_recognizer.abort()
-                return
-            self.voice_recording = True
-            self.voice_busy = False
-            self.voice_ui.emit("window.setVoiceRecording(true)")
-            if self._ptt_down:
-                self.voice_status.emit("🎤 正在录音，松开按键发送")
-            else:
-                self.voice_status.emit("🎤 正在录音，再点一次结束并发送")
+                if not recognizer.start():
+                    if token == self.voice_token:
+                        self.voice_status.emit(
+                            recognizer.error() or "语音识别启动失败"
+                        )
+                    return
+                if token != self.voice_token:
+                    recognizer.shutdown()
+                    return
+                if self.voice_pending_abort:
+                    self.voice_pending_abort = False
+                    recognizer.abort()
+                    return
+                self.voice_recording = True
+                self.voice_ui.emit("window.setVoiceRecording(true)")
+                if self._ptt_down:
+                    self.voice_status.emit("🎤 正在录音，松开按键发送")
+                else:
+                    self.voice_status.emit("🎤 正在录音，再点一次结束并发送")
+            except Exception as exc:
+                if token == self.voice_token:
+                    self.voice_status.emit(f"语音输入启动失败：{exc}")
+            finally:
+                if token == self.voice_token:
+                    if diagnostics:
+                        diagnostics.event("asr.initialize.end", self._voice_trace_id,
+                                          duration_ms=round((time.monotonic() - started) * 1000),
+                                          recording=self.voice_recording)
+                    self.voice_busy = False
+                    self.voice_ui.emit("window.setVoiceBusy(false, '点击开始或结束录音')")
 
         self.voice_busy = True
+        self._run_js("window.setVoiceBusy(true, '正在启动本地语音识别…')")
         self._notify("正在启动本地语音识别…")
         threading.Thread(target=_begin, daemon=True).start()
 
@@ -3758,19 +4009,32 @@ class PetWindow(QWidget):
         self.voice_recording = False
         self.voice_busy = True
         self._run_js("window.setVoiceRecording(false)")
+        self._run_js("window.setVoiceBusy(true, '正在识别…')")
         self._notify("录音结束，正在识别…")
+        token = self.voice_token
+        recognizer = self.voice_recognizer
 
         def _finish():
-            token = self.voice_token
+            started = time.monotonic()
             try:
-                text = self.voice_recognizer.stop_and_transcribe()
+                text = recognizer.stop_and_transcribe()
+            except Exception as exc:
+                if token == self.voice_token:
+                    self.voice_status.emit(f"语音识别失败：{exc}")
+                return
             finally:
-                self.voice_busy = False
+                if token == self.voice_token:
+                    diagnostics = getattr(self, "diagnostics", None)
+                    if diagnostics:
+                        diagnostics.event("asr.transcribe.end", getattr(self, "_voice_trace_id", None),
+                                          duration_ms=round((time.monotonic() - started) * 1000))
+                    self.voice_busy = False
+                    self.voice_ui.emit("window.setVoiceBusy(false, '点击开始或结束录音')")
             if token != self.voice_token:
                 return
             if not text:
                 self.voice_status.emit(
-                    self.voice_recognizer.error() or "没听清，再说一次？"
+                    recognizer.error() or "没听清，再说一次？"
                 )
                 return
             # 填进输入框并直接发送，不需要再点发送按钮
@@ -3781,7 +4045,7 @@ class PetWindow(QWidget):
 
     def _voice_send_text(self, text):
         self._run_js("window.showChatReply('…', 60000)")
-        self.handle_chat(text)
+        self.handle_chat(text, turn_id=getattr(self, "_voice_trace_id", None))
 
     # ---------- 按住说话快捷键 ----------
 
@@ -3830,12 +4094,15 @@ class PetWindow(QWidget):
 
     def _on_ptt_down(self):
         if self.voice_chat_active:
+            self.interrupt_dialogue()
             return
         if not self.voice_cfg.get("enabled"):
             return
         if not self.chat_mode:
             self._notify("语音输入要在聊天模式下使用，先打开聊天模式吧")
             return
+        if self.dialogue.busy:
+            self.interrupt_dialogue()
         if self.voice_busy:
             return
         if self.voice_recording:
@@ -3889,6 +4156,8 @@ class PetWindow(QWidget):
             return
         self.voice_chat_cfg["enabled"] = False
         save_voice_chat_config(self.voice_chat_cfg)
+        if self.voice_chat_active:
+            self.interrupt_dialogue()
         self.voice_chat_stop.set()
         self.voice_chat_active = False
         try:
@@ -4055,10 +4324,78 @@ class PetWindow(QWidget):
                 except Exception:
                     pass
 
+    def _request_stop_playback(self):
+        self._speech_generation += 1
+        self.playback_stop.emit()
+
+    def _update_dialogue_busy(self, _busy=None):
+        if not self.page_loaded:
+            return
+        game_busy = self.sts2_timer.isActive() or (self.sts2_busy and not self.sts2_stop.is_set())
+        busy = self.dialogue.busy or game_busy
+        self._run_js(f"window.setDialogueBusy({str(busy).lower()})")
+
+    def interrupt_dialogue(self):
+        if threading.current_thread() is not threading.main_thread():
+            self.dialogue_interrupt_requested.emit()
+            return
+        if self.sts2_busy or self.sts2_timer.isActive():
+            self._sts2_pause(notify=False)
+        self.dialogue.interrupt()
+        self._notify("已停止，接着说吧")
+
+    def _stop_playback(self):
+        if self._player is not None:
+            self._player.stop()
+        self._play_done.set()
+        self.voice_tts_done.set()
+        kept = []
+        while True:
+            try:
+                item = self._tts_queue.get_nowait()
+            except queue.Empty:
+                break
+            if item is not None and item[0] == self._speech_generation:
+                kept.append(item)
+            self._tts_queue.task_done()
+        for item in kept:
+            self._tts_queue.put(item)
+        self._run_js(f"window.stopSpeech({self._speech_generation})")
+
+    def _wait_for_speech(self, sent):
+        if not sent:
+            return
+        if self._soullink_usable():
+            self.voice_tts_done.clear()
+            self._speech_error = ''
+            self.soullink_js.emit(f"window.finishSpeech({self._speech_generation})")
+        deadline = time.monotonic() + 90
+        with pet_runtime.stage("tts.playback_wait"):
+            while time.monotonic() < deadline:
+                pet_runtime.checkpoint()
+                if self._soullink_usable():
+                    if self.voice_tts_done.wait(0.1):
+                        if getattr(self, '_speech_error', ''):
+                            raise RuntimeError('语音播放失败，请检查语音服务或音频输出。')
+                        return
+                else:
+                    with self._tts_queue.mutex:
+                        if self._tts_queue.unfinished_tasks == 0:
+                            return
+                    time.sleep(0.1)
+            self.diagnostics.event("tts.playback_timeout")
+            self._request_stop_playback()
+            raise RuntimeError('语音播放等待超时。')
+
     def _stream_chat(self, history, user_content, memory_note, text):
         """流式聊天 + 逐句朗读；返回 (完整回复, 是否发出了朗读)。"""
         chunker = _SpeechChunker()
         sent_speech = [0]
+        generation = self._speech_generation
+        self.voice_tts_done.clear()
+        started = time.monotonic()
+        first_chunk = [True]
+        generated = []
         soullink_mode = self._soullink_usable()
         standalone_ok = bool(
             self.voice_chat_cfg.get("tts_enabled")
@@ -4066,39 +4403,69 @@ class PetWindow(QWidget):
         )
 
         def _push(sentence):
+            pet_runtime.checkpoint()
             clean = self._tts_text(sentence)
             if not clean:
                 return
             if soullink_mode:
-                self.soullink_speech.emit(clean)
+                self.voice_tts_done.clear()
+                self.soullink_speech.emit(clean, generation)
             elif standalone_ok:
-                self._tts_queue.put(clean)
+                self._tts_queue.put((generation, clean, pet_runtime.current_turn_id()))
+            else:
+                return
             sent_speech[0] += 1
 
         def _on_chunk(chunk):
+            pet_runtime.checkpoint()
+            generated.append(chunk)
+            if first_chunk[0]:
+                first_chunk[0] = False
+                pet_runtime.mark("model.first_chunk",
+                                 duration_ms=round((time.monotonic() - started) * 1000))
             for sentence in chunker.feed(chunk):
                 _push(sentence)
 
-        stream_ok = True
+        flush_reply = True
         try:
-            reply = self.chat_client.chat_stream(
-                history,
-                user_content,
-                memory_note=memory_note,
-                on_chunk=_on_chunk,
-            )
+            with pet_runtime.stage("model.stream"):
+                reply = self.chat_client.chat_stream(
+                    history, user_content, memory_note=memory_note, on_chunk=_on_chunk)
+        except pet_runtime.TurnCancelled:
+            if generated:
+                self.memory.record_turn(
+                    text, "（回复生成途中被打断）" + "".join(generated),
+                    source="interrupted", extract=False)
+            raise
         except Exception:
-            stream_ok = False
+            flush_reply = False
             # 流式不可用/中途失败：退回一次性请求
-            reply = self.chat_client.chat(
-                history, user_content, memory_note=memory_note
-            )
-        if stream_ok or sent_speech[0] == 0:
+            reply = self.chat_client.chat(history, user_content, memory_note=memory_note)
+            if sent_speech[0] == 0:
+                flush_reply = True
+                chunker = _SpeechChunker()
+                for sentence in chunker.feed(reply):
+                    _push(sentence)
+        if flush_reply:
             for sentence in chunker.flush():
                 _push(sentence)
         return reply, sent_speech[0] > 0
 
     def _voice_turn(self, text):
+        if self._handle_sts2_command(text):
+            return
+        if str(text).strip() in ("停一下", "打住", "停止朗读", "先别说了", "别说了"):
+            self.interrupt_dialogue()
+            if self.mc_cfg.get("enabled") and str(text).strip() == "停一下":
+                self.mc_stop_now()
+            return
+        future = self.dialogue.submit("voice", lambda: self._voice_turn_worker(text))
+        try:
+            future.result()
+        except pet_runtime.TurnCancelled:
+            return
+
+    def _voice_turn_worker(self, text):
         """处理一句语音：可选读屏 + 聊天 + 记忆 + 气泡 + TTS 朗读。"""
         _voice_chat_diag(f"turn text={text[:40]!r}")
         if self.mc_cfg.get("enabled") and not self._is_screen_look_request(
@@ -4119,7 +4486,10 @@ class PetWindow(QWidget):
             shot = self._request_screen_shot()
             if shot:
                 try:
-                    screen_desc = self.vision_client.describe(shot[0], shot[1])
+                    with pet_runtime.stage("vision"):
+                        screen_desc = self.vision_client.describe(shot[0], shot[1])
+                except pet_runtime.TurnCancelled:
+                    raise
                 except Exception:
                     screen_desc = None
         if screen_desc:
@@ -4129,12 +4499,12 @@ class PetWindow(QWidget):
                 "请参考屏幕内容自然回答我的问题，不要提及“看了屏幕”或识图。）"
             )
         mc_note = self._mc_context_note()
+        mc_note = "\n".join(note for note in (mc_note, self._sts2_context_note()) if note)
         if mc_note:
             user_content = f"{user_content}\n（背景信息：{mc_note}）"
         try:
-            history, memory_note = self.memory.dialogue_context(
-                text, history_limit=8
-            )
+            with pet_runtime.stage("memory.recall"):
+                history, memory_note = self.memory.dialogue_context(text)
         except Exception:
             history, memory_note = [], None
         success = False
@@ -4147,16 +4517,24 @@ class PetWindow(QWidget):
                 history, user_content, memory_note, text
             )
             success = True
+        except pet_runtime.TurnCancelled:
+            self.voice_recognizer.set_microphone(True)
+            raise
         except Exception as exc:
             reply = f"（连接失败：{exc}）"
         try:
+            pet_runtime.checkpoint()
+            if success:
+                if screen_desc:
+                    self.memory.record_line("user", f"（屏幕观察：{screen_desc}）", source="screen")
+                with pet_runtime.stage("memory.record"):
+                    self.memory.record_turn(text, reply, source="voice", extract=True,
+                                            chat_client=self.chat_client)
             if speech_sent:
-                if self._soullink_usable():
-                    self.voice_tts_done.wait(timeout=90)
-                else:
-                    self._tts_queue.join()
+                self._wait_for_speech(speech_sent)
         finally:
             self.voice_recognizer.set_microphone(True)
+        pet_runtime.checkpoint()
         # 结尾情绪反应：朗读已由流式逐句完成，这里只做表情不重复朗读
         if (
             self._soullink_usable()
@@ -4182,24 +4560,241 @@ class PetWindow(QWidget):
                 self.chat_reply_quiet.emit(reply)
         else:
             self.chat_reply_quiet.emit(reply)
-        # 记忆落盘（提炼放最后，不阻塞朗读）
+    # ---------- Slay the Spire 2 (STS2MCP) ----------
+
+    def _handle_sts2_command(self, text):
+        text = str(text).strip()
+        if threading.current_thread() is not threading.main_thread():
+            recognised = (text in ("玩尖塔", "去玩尖塔", "开始尖塔", "继续尖塔",
+                "去玩杀戮尖塔2", "玩杀戮尖塔2", "继续杀戮尖塔2", "尖塔走一步", "尖塔行动一步", "尖塔打一步")
+                or text.startswith(("尖塔：", "尖塔:", "杀戮尖塔2：", "杀戮尖塔2:"))
+                or any(word in text for word in ("暂停尖塔", "停止尖塔", "停下尖塔", "别玩尖塔",
+                                                "暂停杀戮尖塔", "停止杀戮尖塔")))
+            if recognised:
+                self.sts2_ui_command.emit(text)
+            return recognised
+        if any(word in text for word in ("暂停尖塔", "停止尖塔", "停下尖塔", "别玩尖塔",
+                                         "暂停杀戮尖塔", "停止杀戮尖塔")):
+            self._sts2_pause()
+            return True
+        if text in ("玩尖塔", "去玩尖塔", "开始尖塔", "继续尖塔", "去玩杀戮尖塔2",
+                    "玩杀戮尖塔2", "继续杀戮尖塔2"):
+            self._sts2_start()
+            return True
+        if text in ("尖塔走一步", "尖塔行动一步", "尖塔打一步"):
+            self._sts2_step()
+            return True
+        for prefix in ("尖塔：", "尖塔:", "杀戮尖塔2：", "杀戮尖塔2:"):
+            if text.startswith(prefix):
+                instruction = text[len(prefix):].strip()
+                if instruction in ("暂停", "停止", "停下", "别动"):
+                    self._sts2_pause()
+                elif instruction:
+                    self._sts2_step(instruction)
+                return True
+        return False
+
+    def _sts2_context_note(self):
+        if not self.sts2_cfg['enabled']:
+            return ""
+        status = "正在自动游玩" if self.sts2_timer.isActive() else "已暂停"
+        return f"《杀戮尖塔2》{status}；最近一次观察：{self.sts2_last_state}。不要虚构新的操作结果。"
+
+    def _sts2_pause(self, notify=True):
+        self.sts2_timer.stop()
+        self.sts2_stop.set()
+        self.sts2_token += 1
+        self._update_dialogue_busy()
+        if notify:
+            self.sts2_status.emit("杀戮尖塔2 已暂停")
+
+    def set_sts2_enabled(self, enabled):
+        self._sts2_pause(notify=False)
+        self.sts2_cfg['enabled'] = bool(enabled)
+        self.sts2_brain = None
+        self.sts2_last_state = "尚未连接"
         try:
-            if success:
-                if screen_desc:
-                    self.memory.record_line(
-                        "user",
-                        f"（我看到的屏幕内容：{screen_desc}）",
-                        source="screen",
-                    )
-                self.memory.record_turn(
-                    text,
-                    reply,
-                    source="voice",
-                    extract=True,
-                    chat_client=self.chat_client,
-                )
-        except Exception:
-            pass
+            save_sts2_config(self.sts2_cfg)
+        except (OSError, ValueError) as exc:
+            self.sts2_status.emit(f"尖塔设置未保存：{exc}")
+            return
+        if enabled:
+            self._sts2_check()
+        else:
+            self.sts2_status.emit("杀戮尖塔2 接入已关闭")
+
+    def _sts2_start(self):
+        if self.sts2_busy:
+            self.sts2_status.emit("上一项尖塔操作还在结束，请稍后继续")
+            return
+        if not self.chat_client.ready():
+            self.sts2_status.emit("玩尖塔需要先配置聊天接口")
+            return
+        if not self.sts2_cfg['enabled']:
+            self.sts2_cfg['enabled'] = True
+            try:
+                save_sts2_config(self.sts2_cfg)
+            except (OSError, ValueError) as exc:
+                self.sts2_status.emit(f"尖塔设置未保存：{exc}")
+                return
+        self.sts2_steps = 0
+        if self.sts2_brain is not None:
+            self.sts2_brain.reset_for_resume()
+            self.sts2_brain.llm = self.chat_client.complete
+            self.sts2_brain.persona = self.chat_client.persona
+        self.sts2_timer.start(self.sts2_cfg['interval_seconds'] * 1000)
+        self._sts2_step()
+
+    def _sts2_step(self, instruction=''):
+        if self.sts2_busy:
+            if instruction:
+                self.sts2_status.emit("尖塔正在处理上一步，等完成后再下指令")
+            return
+        if not self.sts2_cfg['enabled']:
+            self.sts2_status.emit("请先在右键菜单开启杀戮尖塔2 接入")
+            return
+        if not self.chat_client.ready():
+            self._sts2_pause(notify=False)
+            self.sts2_status.emit("玩尖塔需要先配置聊天接口")
+            return
+        self.sts2_busy = True
+        self.sts2_token += 1
+        token = self.sts2_token
+        stop = self.sts2_stop = threading.Event()
+        self._update_dialogue_busy()
+        if self.sts2_brain is None:
+            self.sts2_brain = sts2_bridge.Sts2Brain(
+                sts2_bridge.Sts2Client(self.sts2_cfg['port']), self.chat_client.complete,
+                self.sts2_cfg, self.chat_client.persona, self.diagnostics)
+        brain = self.sts2_brain
+
+        def work():
+            try:
+                outcome = brain.step(stop, str(instruction or ''), before_action=self._sts2_before_action)
+            except Exception as exc:
+                outcome = exc
+            self.sts2_finished.emit(outcome, token)
+
+        threading.Thread(target=work, name='pet-sts2', daemon=True).start()
+
+    def _show_sts2_text(self, text, delivery):
+        if (delivery['stop'].is_set() or not self.page_loaded
+                or delivery['generation'] != self._speech_generation):
+            delivery['done'].set()
+            return
+        emotion = classify_emotion(text)
+        script = (f'window.chatReact({json.dumps(emotion)});'
+                  f'window.showChatReply({json.dumps(text)}, 6000); true')
+
+        def shown(ok):
+            delivery['shown'] = ok is True
+            delivery['done'].set()
+
+        self.view.page().runJavaScript(script, shown)
+
+    def _sts2_before_action(self, text, stop):
+        sts2_bridge.checkpoint(stop)
+        if not self.sts2_cfg['narration']:
+            return
+
+        def deliver_text(reply):
+            delivery = {'stop': stop, 'done': threading.Event(), 'shown': False,
+                        'generation': self._speech_generation}
+            self.sts2_text_requested.emit(reply, delivery)
+            deadline = time.monotonic() + 10
+            while not delivery['done'].wait(.1):
+                pet_runtime.checkpoint()
+                sts2_bridge.checkpoint(stop)
+                if time.monotonic() >= deadline:
+                    raise sts2_bridge.Sts2Error('这一步的话还没显示出来，我先暂停一下。')
+            sts2_bridge.checkpoint(stop)
+            if not delivery['shown']:
+                raise sts2_bridge.Sts2Error('这一步的话还没显示出来，我先暂停一下。')
+
+        def narrate():
+            sts2_bridge.checkpoint(stop)
+            generation = self._speech_generation
+            with pet_runtime.stage('sts2.narration'):
+                self._emit_speech(text, text_delivery=deliver_text, require_audio=True)
+            pet_runtime.checkpoint()
+            sts2_bridge.checkpoint(stop)
+            if generation != self._speech_generation:
+                raise sts2_bridge.Sts2Cancelled('这一步的旁白被打断了，动作还没执行。')
+
+        future = self.dialogue.submit('sts2.narration', narrate, priority=10)
+        try:
+            while True:
+                sts2_bridge.checkpoint(stop)
+                try:
+                    future.result(timeout=.1)
+                    break
+                except FutureTimeoutError:
+                    if future.done():
+                        future.result()
+        except (pet_runtime.TurnCancelled, CancelledError) as exc:
+            raise sts2_bridge.Sts2Cancelled('这一步的旁白被打断了，动作还没执行。') from exc
+        finally:
+            if stop.is_set():
+                future.cancel()
+        sts2_bridge.checkpoint(stop)
+
+    def _sts2_on_finished(self, result, token):
+        self.sts2_busy = False
+        self._update_dialogue_busy()
+        if token != self.sts2_token or self.sts2_stop.is_set():
+            return
+        if isinstance(result, Exception):
+            self._sts2_pause(notify=False)
+            self.diagnostics.event('sts2.error', error=type(result).__name__,
+                                   **getattr(result, 'diagnostic_data', {}))
+            self.sts2_status.emit(f"尖塔已暂停：{result}")
+            return
+        self.sts2_last_state = result.state
+        if result.status == 'paused':
+            self._sts2_pause(notify=False)
+            self.sts2_status.emit(result.narration)
+            return
+        if result.status == 'acted':
+            self.sts2_steps += 1
+            self.dialogue.note("尖塔进展", result.narration)
+            if result.narrated:
+                self.memory.record_line('assistant', result.narration, source='sts2')
+            if self.sts2_steps >= self.sts2_cfg['max_steps']:
+                self._sts2_pause(notify=False)
+                self.sts2_status.emit(f"尖塔已完成 {self.sts2_steps} 次操作，达到上限后暂停")
+            elif not self.sts2_timer.isActive():
+                self.sts2_status.emit("尖塔已完成一步")
+
+    def _sts2_check(self):
+        port = self.sts2_cfg['port']
+        status = "自动游玩中" if self.sts2_timer.isActive() else "已暂停"
+
+        def work():
+            try:
+                state = sts2_bridge.Sts2Client(port).state()
+                message = f"STS2MCP 已连接（{status}）：" + sts2_bridge.state_summary(state)
+            except Exception as exc:
+                self.diagnostics.event('sts2.error', error=type(exc).__name__,
+                                       **getattr(exc, 'diagnostic_data', {}))
+                message = str(exc)
+            self.sts2_status.emit(message)
+
+        threading.Thread(target=work, name='pet-sts2-check', daemon=True).start()
+
+    def open_sts2_settings(self):
+        dialog = Sts2SettingsDialog(self.sts2_cfg, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        cfg = dict(self.sts2_cfg, **dialog.values())
+        try:
+            save_sts2_config(cfg)
+        except (OSError, ValueError) as exc:
+            self.sts2_status.emit(f"尖塔设置未保存：{exc}")
+            return
+        self._sts2_pause(notify=False)
+        self.sts2_cfg = sts2_bridge.normalize_config(cfg)
+        self.sts2_brain = None
+        self.sts2_status.emit("杀戮尖塔2 设置已保存，当前保持暂停")
 
     # ---------- Minecraft（Numen） ----------
 
@@ -4299,7 +4894,8 @@ class PetWindow(QWidget):
         if not text:
             return
         if self.mc_cfg.get("narration", True):
-            self._emit_speech(text)
+            self.dialogue.note("游戏进展", text)
+            self.dialogue.submit("mc.narration", lambda: self._emit_speech(text), priority=10)
         try:
             self.memory.record_line("assistant", text, source="mc")
         except Exception:
@@ -4661,9 +5257,12 @@ class PetWindow(QWidget):
         while True:
             item = self._tts_queue.get()
             if item is None:
+                self._tts_queue.task_done()
                 break
             try:
-                self._speak_voice(item)
+                generation, text, turn_id = item
+                if generation == self._speech_generation:
+                    self._speak_voice(text, generation, turn_id)
             except Exception:
                 pass
             self._tts_queue.task_done()
@@ -4676,8 +5275,16 @@ class PetWindow(QWidget):
         finally:
             self._shot_event.set()
 
-    def _speak_voice(self, text):
-        audio, mime = self._tts_client.synthesize(text)
+    def _speak_voice(self, text, generation=None, turn_id=None):
+        if generation is None:
+            generation = self._speech_generation
+        if generation != self._speech_generation:
+            return
+        turn_id = turn_id or pet_runtime.current_turn_id()
+        with self.diagnostics.span("tts.synthesize", turn_id):
+            audio, mime = pet_runtime.cancellable_io(lambda: self._tts_client.synthesize(text))
+        if generation != self._speech_generation:
+            return
         if "wav" in mime:
             ext = ".wav"
         elif "mp3" in mime or "mpeg" in mime:
@@ -4691,44 +5298,66 @@ class PetWindow(QWidget):
             with open(path, "wb") as f:
                 f.write(audio)
             self._play_done.clear()
-            self.voice_play.emit(path)
+            self._media_error = ''
+            self.voice_play.emit(path, generation)
             # 等待播放结束，但随时响应关闭语音对话
-            stop = self.voice_chat_stop
             while not self._play_done.is_set():
-                if stop.is_set():
+                if generation != self._speech_generation:
                     break
                 self._play_done.wait(0.3)
+            if generation == self._speech_generation and self._media_error:
+                raise RuntimeError('音频播放失败。')
         finally:
             try:
                 os.remove(path)
             except Exception:
                 pass
 
-    def _play_voice_file(self, path):
+    def _play_voice_file(self, path, generation):
         from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+
+        if generation != self._speech_generation:
+            self._play_done.set()
+            return
 
         if self._player is None:
             self._audio_output = QAudioOutput(self)
             self._player = QMediaPlayer(self)
             self._player.setAudioOutput(self._audio_output)
             self._player.mediaStatusChanged.connect(self._on_media_status)
+            self._player.errorOccurred.connect(self._on_media_error)
         self._player.stop()
         self._player.setSource(QUrl.fromLocalFile(path))
         if self._audio_output is not None:
-            self._audio_output.setVolume(85)
+            self._audio_output.setVolume(0.85)
         self._player.play()
 
     def _on_media_status(self, status):
         from PySide6.QtMultimedia import QMediaPlayer
 
+        if status == QMediaPlayer.MediaStatus.InvalidMedia:
+            self._media_error = 'Invalid audio'
         if status in (
             QMediaPlayer.MediaStatus.EndOfMedia,
             QMediaPlayer.MediaStatus.InvalidMedia,
         ):
             self._play_done.set()
 
+    def _on_media_error(self, error, message):
+        self._media_error = str(message or error)
+        self._play_done.set()
+
     def _on_tts_played(self):
         """Soullink 朗读结束（由 JS 回调），恢复语音对话的麦克风。"""
+        self.voice_tts_done.set()
+
+    def _on_tts_result(self, generation, error):
+        if generation != self._speech_generation:
+            return
+        self._speech_error = str(error or '')
+        if self._speech_error:
+            self.diagnostics.event('tts.browser_failed', generation=generation,
+                                   error=self._speech_error[:300])
         self.voice_tts_done.set()
 
     # ---------- 读屏幕 ----------
@@ -4765,11 +5394,9 @@ class PetWindow(QWidget):
             self.screen_read_busy = False
             self._notify("读屏幕失败：无法截取屏幕")
             return
-        threading.Thread(
-            target=self._screen_read_worker,
-            args=(shot[0], shot[1]),
-            daemon=True,
-        ).start()
+        future = self.dialogue.submit(
+            "screen", lambda: self._screen_read_worker(shot[0], shot[1]), priority=10)
+        future.add_done_callback(lambda _: setattr(self, "screen_read_busy", False))
 
     def _capture_screen_base64(self):
         """截取主屏幕并压缩为 base64 JPEG（截屏前先隐藏自己）。"""
@@ -4810,7 +5437,10 @@ class PetWindow(QWidget):
                     "请在菜单的 读屏幕设置 里填写 API 信息）"
                 )
             else:
-                desc = self.vision_client.describe(image_b64, mime)
+                with pet_runtime.stage("vision"):
+                    desc = self.vision_client.describe(image_b64, mime)
+                pet_runtime.checkpoint()
+                self.dialogue.note("屏幕观察", desc)
                 prompt = (
                     "（读屏幕）我刚才悄悄看了一眼使用者的屏幕，看到的内容是："
                     f"{desc}\n"
@@ -4831,6 +5461,7 @@ class PetWindow(QWidget):
                         prompt,
                         memory_note=memory_note,
                     )
+                pet_runtime.checkpoint()
                 try:
                     self.memory.record_turn(
                         f"（我看到的屏幕内容：{desc}）",
@@ -4840,23 +5471,30 @@ class PetWindow(QWidget):
                     )
                 except Exception:
                     pass
+        except pet_runtime.TurnCancelled:
+            raise
         except Exception as exc:
             reply = f"（读屏幕失败：{exc}）"
         finally:
             self.screen_read_busy = False
         if reply:
+            pet_runtime.checkpoint()
             if self._soullink_usable() and desc:
                 try:
                     intent = self.soullink_runner.classify(desc)
                 except Exception:
                     intent = None
                 if intent:
+                    pet_runtime.checkpoint()
+                    self.voice_tts_done.clear()
                     self.soullink_event.emit(
                         json.dumps(
-                            {"reply": reply, "intent": intent},
+                            {"reply": reply, "intent": intent,
+                             "generation": self._speech_generation},
                             ensure_ascii=False,
                         )
                     )
+                    self._wait_for_speech(True)
                     return
             self.chat_reply.emit(reply)
 
@@ -5117,12 +5755,19 @@ class PetWindow(QWidget):
         threading.Thread(target=_work, daemon=True).start()
 
     def _send_soullink_event(self, payload_json):
+        payload = json.loads(payload_json)
+        payload.setdefault("generation", self._speech_generation)
+        if payload["generation"] != self._speech_generation:
+            return
+        payload_json = json.dumps(payload, ensure_ascii=False)
         self._run_js(f"window.soullinkChat({payload_json})")
 
-    def _send_soullink_speech(self, text):
+    def _send_soullink_speech(self, text, generation):
         """流式朗读片段：交给前端朗读队列逐句播放。"""
+        if generation != self._speech_generation:
+            return
         self._run_js(
-            f"window.soullinkSpeak({json.dumps(text, ensure_ascii=False)})"
+            f"window.soullinkSpeak({json.dumps(text, ensure_ascii=False)}, {generation})"
         )
 
     def _send_soullink_react(self, payload_json):
@@ -5387,6 +6032,24 @@ class PetWindow(QWidget):
             mc_menu.addAction(
                 QAction("停止当前行动", self, triggered=self.mc_stop_now)
             )
+            sts2_menu = _new_menu("杀戮尖塔2（STS2MCP）", menu)
+            menu.addMenu(sts2_menu)
+            sts2_toggle = QAction("开启接入", self, checkable=True)
+            sts2_toggle.setChecked(self.sts2_cfg['enabled'])
+            sts2_toggle.triggered.connect(self.set_sts2_enabled)
+            sts2_menu.addAction(sts2_toggle)
+            sts2_state = QAction(
+                f"{'自动游玩中' if self.sts2_timer.isActive() else '已暂停'} · "
+                f"{self.sts2_steps}/{self.sts2_cfg['max_steps']} 次操作", self)
+            sts2_state.setEnabled(False)
+            sts2_menu.addAction(sts2_state)
+            sts2_menu.addAction(QAction("开始 / 继续自动游玩", self, triggered=self._sts2_start))
+            sts2_menu.addAction(QAction("暂停自动游玩", self, triggered=lambda: self._sts2_pause()))
+            sts2_menu.addAction(QAction("只行动一步", self, triggered=lambda: self._sts2_step()))
+            sts2_menu.addAction(QAction("检查连接", self, triggered=self._sts2_check))
+            sts2_menu.addAction(QAction("尖塔设置…", self, triggered=self.open_sts2_settings))
+            sts2_menu.addAction(QAction("STS2MCP 下载页", self, triggered=lambda:
+                QDesktopServices.openUrl(QUrl("https://github.com/Gennadiyev/STS2MCP/releases/latest"))))
             memory_menu = _new_menu("记忆", menu)
             menu.addMenu(memory_menu)
             memory_toggle = QAction("开启记忆", self, checkable=True)
@@ -5645,6 +6308,20 @@ class PetWindow(QWidget):
         app = QApplication.instance()
         if app is not None:
             app.quit()
+
+    def _shutdown_services(self):
+        self._sts2_pause(notify=False)
+        self.voice_chat_stop.set()
+        self._stop_ptt()
+        self.dialogue.close()
+        self.memory.close()
+        self.voice_recognizer.cancel()
+        self.voice_recognizer.shutdown()
+        self.mc_stop.set()
+        self.mc_loop_stop.set()
+        self.mc_watch_stop.set()
+        self.soullink_runner.stop()
+        self._tts_queue.put(None)
 
     def save_position(self):
         self.settings["pos_x"] = self.x()
